@@ -64,6 +64,7 @@ option(onnxruntime_BUILD_SHARED_LIB "Build a shared library" OFF)
 option(onnxruntime_ENABLE_MICROSOFT_INTERNAL "Use this option to enable/disable microsoft internal only code" OFF)
 option(onnxruntime_USE_NUPHAR "Build with Nupha" OFF)
 option(onnxruntime_USE_BRAINSLICE "Build with BrainSlice" OFF)
+option(onnxruntime_USE_TRT "Build with TensorRT support" OFF)
 
 set(protobuf_BUILD_TESTS OFF CACHE BOOL "Build protobuf tests" FORCE)
 #nsync tests failed on Mac Build
@@ -117,6 +118,7 @@ if (MSVC)
   SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
   #Disable 4100 globally. Too many this kind errors in protobuf
   SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4100")
+  SET (CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS} /GL")
 else()
   if(onnxruntime_BUILD_FOR_NATIVE_MACHINE)
     string(APPEND CMAKE_CXX_FLAGS_RELEASE " -march=native -mtune=native")
@@ -339,11 +341,12 @@ if (WIN32)
 
     # set linker flags to minimize the binary size.
     if (MSVC)
-      foreach(type EXE SHARED)    
-        set(CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO} /OPT:REF")
+      foreach(type EXE SHARED)
+        set(CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO} /OPT:REF,ICF,LBR")
         set(CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO} /INCREMENTAL:NO")
+        set(CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_${type}_LINKER_FLAGS_RELWITHDEBINFO} /LTCG")
       endforeach()
-    endif()      
+    endif()
 else()
   add_definitions(-DPLATFORM_POSIX)
   # Enable warning in Linux
