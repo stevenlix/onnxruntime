@@ -7,20 +7,32 @@
 namespace onnxruntime {
 namespace test {
 
-using ShapeAndData = std::pair<const std::vector<int64_t>, const std::vector<float>>;
+template <class T>
+using ShapeAndData = std::pair<const std::vector<int64_t>, const std::vector<T>>;
+
+using ShapeAndFloatData = ShapeAndData<float>;
+using ShapeAndStringData = ShapeAndData<std::string>;
 using ExpectResult = OpTester::ExpectResult;
 
-void RunTest(int64_t axis, const std::vector<int64_t> split_sizes, const ShapeAndData& input,
-             const std::vector<ShapeAndData>& outputs,
-             bool expect_failure = false, const std::string& err_msg = {}) {
-  OpTester test("Split");
+template <typename T>
+void RunTest(int64_t axis, const std::vector<int64_t> split_sizes, const ShapeAndData<T>& input,
+             const std::vector<ShapeAndData<T>>& outputs, bool is_tensorrt_supported = true,
+             bool expect_failure = false, bool split_as_input = false,
+             bool is_initializer = true, const std::string& err_msg = {}, bool skip_split_if_empty = true) {
+  int opset_version = split_as_input ? 13 : 7;
+  OpTester test("Split", opset_version, onnxruntime::kOnnxDomain);
 
   test.AddAttribute("axis", axis);
-
-  if (!split_sizes.empty())
-    test.AddAttribute("split", split_sizes);
-
-  test.AddInput<float>("input", input.first, input.second);
+  test.AddInput<T>("input", input.first, input.second);
+  if (!split_sizes.empty()) {
+    if (split_as_input) {
+      test.AddInput<int64_t>("split", {static_cast<int64_t>(split_sizes.size())}, split_sizes, is_initializer);
+    } else {
+      test.AddAttribute("split", split_sizes);
+    }
+  } else if (!skip_split_if_empty) {
+    test.AddOptionalInputEdge<int64_t>();
+  }
 
   int i = 0;
   for (auto& output : outputs) {
@@ -28,22 +40,25 @@ void RunTest(int64_t axis, const std::vector<int64_t> split_sizes, const ShapeAn
     auto& data = output.second;
     std::ostringstream oss;
     oss << "output" << i++;
-    test.AddOutput<float>(oss.str().c_str(), shape, data);
+    test.AddOutput<T>(oss.str().c_str(), shape, data);
   }
-
-  test.Run(expect_failure ? ExpectResult::kExpectFailure : ExpectResult::kExpectSuccess, err_msg);
+  std::unordered_set<std::string> excluded_providers;
+  if (!is_tensorrt_supported) {
+    excluded_providers.insert(kTensorrtExecutionProvider);
+  }
+  test.Run(expect_failure ? ExpectResult::kExpectFailure : ExpectResult::kExpectSuccess, err_msg, excluded_providers);
 }
 
-TEST(SplitOperatorTest, Axis0EqualSplit) {
+TEST(SplitOperatorTest, Axis0EqualSplitFloat) {
   const int64_t axis = 0;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{4, 2},  // shape
-                        {1.f, 2.f,
-                         3.f, 4.f,
-                         5.f, 6.f,
-                         7.f, 8.f}};
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
 
   outputs.push_back({{2, 2},
                      {1.f, 2.f,
@@ -53,19 +68,72 @@ TEST(SplitOperatorTest, Axis0EqualSplit) {
                      {5.f, 6.f,
                       7.f, 8.f}});
 
-  RunTest(axis, {}, input, outputs);
+  RunTest<float>(axis, {}, input, outputs, false);  //TensorRT parser: Assertion failed: axis != BATCH_DIM
 }
 
-TEST(SplitOperatorTest, Axis0UnequalSplit) {
+template <typename T, typename = typename std::enable_if<std::is_integral<T>::value, T>::type>
+static void SplitTestInt() {
   const int64_t axis = 0;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndData<T>> outputs;
 
   // input shape and data
-  ShapeAndData input = {{4, 2},  // shape
-                        {1.f, 2.f,
-                         3.f, 4.f,
-                         5.f, 6.f,
-                         7.f, 8.f}};
+  ShapeAndData<T> input = {{4, 2},  // shape
+                           {1, 2,
+                            3, 4,
+                            5, 6,
+                            7, 8}};
+
+  outputs.push_back({{2, 2},
+                     {1, 2,
+                      3, 4}});
+
+  outputs.push_back({{2, 2},
+                     {5, 6,
+                      7, 8}});
+
+  RunTest<T>(axis, {}, input, outputs, false);  //TensorRT parser: Assertion failed: axis != BATCH_DIM
+}
+
+TEST(SplitOperatorTest, Axis0EqualSplitInt32) {
+  SplitTestInt<int32_t>();
+}
+
+TEST(SplitOperatorTest, Axis0EqualSplitInt64) {
+  SplitTestInt<int64_t>();
+}
+
+TEST(SplitOperatorTest, Axis0EqualSplitString) {
+  const int64_t axis = 0;
+  std::vector<ShapeAndStringData> outputs;
+
+  // input shape and data
+  ShapeAndStringData input = {{4, 2},  // shape
+                              {"a", "b",
+                               "c", "d",
+                               "e", "f",
+                               "g", "h"}};
+
+  outputs.push_back({{2, 2},
+                     {"a", "b",
+                      "c", "d"}});
+
+  outputs.push_back({{2, 2},
+                     {"e", "f",
+                      "g", "h"}});
+
+  RunTest<std::string>(axis, {}, input, outputs, false);  //TensorRT parser: Assertion failed: axis != BATCH_DIM
+}
+
+TEST(SplitOperatorTest, Axis0UnequalSplitFloat) {
+  const int64_t axis = 0;
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
 
   std::vector<int64_t> splits{1, 3};
 
@@ -76,17 +144,40 @@ TEST(SplitOperatorTest, Axis0UnequalSplit) {
                       5.f, 6.f,
                       7.f, 8.f}});
 
-  RunTest(axis, splits, input, outputs);
+  RunTest<float>(axis, splits, input, outputs, false);  //TensorRT parser: Assertion failed: axis != BATCH_DIM
 }
 
-TEST(SplitOperatorTest, Axis1EqualSplit) {
-  const int64_t axis = 1;
-  std::vector<ShapeAndData> outputs;
+TEST(SplitOperatorTest, Axis0UnequalSplitString) {
+  const int64_t axis = 0;
+  std::vector<ShapeAndStringData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{2, 4},
-                        {1.f, 2.f, 3.f, 4.f,
-                         5.f, 6.f, 7.f, 8.f}};
+  ShapeAndStringData input = {{4, 2},  // shape
+                              {"a", "b",
+                               "c", "d",
+                               "e", "f",
+                               "g", "h"}};
+
+  std::vector<int64_t> splits{1, 3};
+
+  outputs.push_back({{1, 2}, {"a", "b"}});
+
+  outputs.push_back({{3, 2},
+                     {"c", "d",
+                      "e", "f",
+                      "g", "h"}});
+
+  RunTest<std::string>(axis, splits, input, outputs, false);  //TensorRT parser: Assertion failed: axis != BATCH_DIM
+}
+
+TEST(SplitOperatorTest, Axis1EqualSplitFloat) {
+  const int64_t axis = 1;
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{2, 4},
+                             {1.f, 2.f, 3.f, 4.f,
+                              5.f, 6.f, 7.f, 8.f}};
 
   outputs.push_back({{2, 2},
                      {1.f, 2.f,
@@ -96,17 +187,37 @@ TEST(SplitOperatorTest, Axis1EqualSplit) {
                      {3.f, 4.f,
                       7.f, 8.f}});
 
-  RunTest(axis, {}, input, outputs);
+  RunTest<float>(axis, {}, input, outputs, false);
 }
 
-TEST(SplitOperatorTest, Axis1UnequalSplit) {
+TEST(SplitOperatorTest, Axis1EqualSplitString) {
   const int64_t axis = 1;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndStringData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{2, 4},
-                        {1.f, 2.f, 3.f, 4.f,
-                         5.f, 6.f, 7.f, 8.f}};
+  ShapeAndStringData input = {{2, 4},
+                              {"a", "b", "c", "d",
+                               "e", "f", "g", "h"}};
+
+  outputs.push_back({{2, 2},
+                     {"a", "b",
+                      "e", "f"}});
+
+  outputs.push_back({{2, 2},
+                     {"c", "d",
+                      "g", "h"}});
+
+  RunTest<std::string>(axis, {}, input, outputs, false);
+}
+
+TEST(SplitOperatorTest, Axis1UnequalSplitFloat) {
+  const int64_t axis = 1;
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{2, 4},
+                             {1.f, 2.f, 3.f, 4.f,
+                              5.f, 6.f, 7.f, 8.f}};
 
   std::vector<int64_t> splits{3, 1};
 
@@ -118,27 +229,48 @@ TEST(SplitOperatorTest, Axis1UnequalSplit) {
                      {4.f,
                       8.f}});
 
-  RunTest(axis, splits, input, outputs);
+  RunTest<float>(axis, splits, input, outputs, false);
 }
 
-ShapeAndData CreateInput(std::vector<int64_t> shape) {
+TEST(SplitOperatorTest, Axis1UnequalSplitString) {
+  const int64_t axis = 1;
+  std::vector<ShapeAndStringData> outputs;
+
+  // input shape and data
+  ShapeAndStringData input = {{2, 4},
+                              {"a", "b", "c", "d",
+                               "e", "f", "g", "h"}};
+
+  std::vector<int64_t> splits{3, 1};
+
+  outputs.push_back({{2, 3},
+                     {"a", "b", "c",
+                      "e", "f", "g"}});
+
+  outputs.push_back({{2, 1},
+                     {"d",
+                      "h"}});
+
+  RunTest<std::string>(axis, splits, input, outputs, false);
+}
+
+template <typename T>
+ShapeAndData<T> CreateInput(std::vector<int64_t> shape) {
   auto size = TensorShape(shape).Size();
 
-  float i = 0.f, increment = 1.f;
-  // generate the elements for the data starting at 1.f
-  std::vector<float> data;
+  T i = static_cast<T>(0), increment = static_cast<T>(1);
+  // generate the elements for the data starting at 1
+  std::vector<T> data;
   std::generate_n(std::back_inserter(data), size, [&]() { return i += increment; });
 
-  ShapeAndData input = {shape, data};
-
-  return input;
+  return ShapeAndData<T>{shape, data};
 }
 
 TEST(SplitOperatorTest, Axis2EqualSplit) {
   const int64_t axis = 2;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
-  ShapeAndData input = CreateInput({2, 2, 6});
+  ShapeAndFloatData input = CreateInput<float>({2, 2, 6});
 
   outputs.push_back({{2, 2, 2},
                      {1.f, 2.f,
@@ -161,14 +293,14 @@ TEST(SplitOperatorTest, Axis2EqualSplit) {
                       17.f, 18.f,
                       23.f, 24.f}});
 
-  RunTest(axis, {}, input, outputs);
+  RunTest<float>(axis, {}, input, outputs, false);
 }
 
 TEST(SplitOperatorTest, Axis2UnequalSplit) {
   const int64_t axis = 2;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
-  ShapeAndData input = CreateInput({2, 2, 6});
+  ShapeAndFloatData input = CreateInput<float>({2, 2, 6});
 
   std::vector<int64_t> splits{1, 2, 3};
 
@@ -193,15 +325,24 @@ TEST(SplitOperatorTest, Axis2UnequalSplit) {
                       16.f, 17.f, 18.f,
                       22.f, 23.f, 24.f}});
 
-  RunTest(axis, splits, input, outputs);
+  RunTest<float>(axis, splits, input, outputs, false);
+}
+
+TEST(SplitOperatorTest, ZeroSizeInput) {
+  const int64_t axis = -1;
+  std::vector<ShapeAndFloatData> outputs{{{0, 1}, {}}, {{0, 1}, {}}};
+
+  ShapeAndFloatData input = CreateInput<float>({0, 2});
+
+  RunTest<float>(axis, {}, input, outputs, false);
 }
 
 // test a split of a dimension that has leading and trailing dimensions
 TEST(SplitOperatorTest, Axis1SplitMiddleDimensionEqually) {
   const int64_t axis = 1;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
-  ShapeAndData input = CreateInput({2, 4, 4});
+  ShapeAndFloatData input = CreateInput<float>({2, 4, 4});
 
   outputs.push_back({{2, 2, 4},
                      {1.f, 2.f, 3.f, 4.f,
@@ -217,15 +358,15 @@ TEST(SplitOperatorTest, Axis1SplitMiddleDimensionEqually) {
                       25.f, 26.f, 27.f, 28.f,
                       29.f, 30.f, 31.f, 32.f}});
 
-  RunTest(axis, {}, input, outputs);
+  RunTest<float>(axis, {}, input, outputs, false);
 }
 
 // test a split of a dimension that has leading and trailing dimensions
 TEST(SplitOperatorTest, Axis1SplitMiddleDimensionUnequally) {
   const int64_t axis = 1;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
-  ShapeAndData input = CreateInput({2, 4, 4});
+  ShapeAndFloatData input = CreateInput<float>({2, 4, 4});
 
   std::vector<int64_t> splits{1, 3};
 
@@ -243,17 +384,17 @@ TEST(SplitOperatorTest, Axis1SplitMiddleDimensionUnequally) {
                       25.f, 26.f, 27.f, 28.f,
                       29.f, 30.f, 31.f, 32.f}});
 
-  RunTest(axis, splits, input, outputs);
+  RunTest<float>(axis, splits, input, outputs, false);
 }
 
 TEST(SplitOperatorTest, NegativeAxis) {
   const int64_t axis = -1;  // split last axis equally
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{2, 4},
-                        {1.f, 2.f, 3.f, 4.f,
-                         5.f, 6.f, 7.f, 8.f}};
+  ShapeAndFloatData input = {{2, 4},
+                             {1.f, 2.f, 3.f, 4.f,
+                              5.f, 6.f, 7.f, 8.f}};
 
   outputs.push_back({{2, 2},
                      {1.f, 2.f,
@@ -263,61 +404,109 @@ TEST(SplitOperatorTest, NegativeAxis) {
                      {3.f, 4.f,
                       7.f, 8.f}});
 
-  RunTest(axis, {}, input, outputs);
+  RunTest<float>(axis, {}, input, outputs, false);
 }
 
 TEST(SplitOperatorTest, InvalidAxis) {
   const int64_t axis = 2;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{4, 2},  // shape
-                        {1.f, 2.f,
-                         3.f, 4.f,
-                         5.f, 6.f,
-                         7.f, 8.f}};
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
 
   outputs.push_back({{1}, {0.f}});
 
-  RunTest(axis, {}, input, outputs, true, "Invalid value of attribute 'axis'");
+  RunTest<float>(axis, {}, input, outputs, true, true, false, true, "Invalid value of attribute 'axis'");
 }
 
 // sum of values in splits is too small
 TEST(SplitOperatorTest, SplitAttributeSumTooSmall) {
   const int64_t axis = 0;
-  std::vector<ShapeAndData> outputs;
+  std::vector<ShapeAndFloatData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{4, 2},  // shape
-                        {1.f, 2.f,
-                         3.f, 4.f,
-                         5.f, 6.f,
-                         7.f, 8.f}};
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
 
   std::vector<int64_t> splits{1, 2};  // should sum to 4
 
   outputs.push_back({{1, 2}, {1.f, 2.f}});
   outputs.push_back({{2, 2}, {3.f, 4.f, 5.f, 6.f}});
 
-  RunTest(axis, splits, input, outputs, true, "Cannot split using values in 'split' attribute");
+  RunTest<float>(axis, splits, input, outputs, false, true, false, true, "[ShapeInferenceError] Mismatch between the sum of 'split'");  //TensorRT parser: Assertion failed: axis != BATCH_DIM
 }
 
 TEST(SplitOperatorTest, InvalidValueInSplitAttribute) {
-  const int64_t axis = 0;
-  std::vector<ShapeAndData> outputs;
+  const int64_t axis = -1;
+  std::vector<ShapeAndFloatData> outputs;
 
   // input shape and data
-  ShapeAndData input = {{4, 2},  // shape
-                        {1.f, 2.f,
-                         3.f, 4.f,
-                         5.f, 6.f,
-                         7.f, 8.f}};
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
 
   std::vector<int64_t> splits{1, 0, 3};  // 0 is not valid
   outputs.push_back({{1, 2}, {1.f, 2.f}});
   outputs.push_back({{3, 2}, {3.f, 4.f, 5.f, 6.f, 7.f, 8.f}});
 
-  RunTest(axis, splits, input, outputs, true, "Invalid value in 'split' attribute");
+  RunTest<float>(axis, splits, input, outputs, false, true, false, true, "[ShapeInferenceError] Mismatch between number of splits");  //TensorRT parser: Assertion failed: axis != BATCH_DIM
+}
+
+// split as input
+TEST(SplitOperatorTest, Axis0UnequalSplitInputFloat) {
+  const int64_t axis = 0;
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
+
+  std::vector<int64_t> splits{1, 3};
+
+  outputs.push_back({{1, 2}, {1.f, 2.f}});
+
+  outputs.push_back({{3, 2},
+                     {3.f, 4.f,
+                      5.f, 6.f,
+                      7.f, 8.f}});
+
+  RunTest<float>(axis, splits, input, outputs, false, false, true);
+}
+
+// split as input
+TEST(SplitOperatorTest, Axis0UnequalSplitInputFloat_not_initializer) {
+  const int64_t axis = 0;
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{4, 2},  // shape
+                             {1.f, 2.f,
+                              3.f, 4.f,
+                              5.f, 6.f,
+                              7.f, 8.f}};
+
+  std::vector<int64_t> splits{1, 3};
+
+  outputs.push_back({{1, 2}, {1.f, 2.f}});
+
+  outputs.push_back({{3, 2},
+                     {3.f, 4.f,
+                      5.f, 6.f,
+                      7.f, 8.f}});
+
+  RunTest<float>(axis, splits, input, outputs, false, false, true, false);
 }
 
 /*
@@ -380,5 +569,72 @@ SplitAxis2()
 SplitMiddleDimension()
 
 */
+
+// test split for uint8_t data that has leading and trailing dimensions
+TEST(SplitOperatorTest, Uint8Axis1SplitMiddleDimensionUnequally) {
+  const int64_t axis = 1;
+  std::vector<ShapeAndData<uint8_t>> outputs;
+
+  ShapeAndData<uint8_t> input = CreateInput<uint8_t>({2, 4, 4});
+
+  std::vector<int64_t> splits{1, 3};
+
+  outputs.push_back({{2, 1, 4},
+                     {1, 2, 3, 4,
+
+                      17, 18, 19, 20}});
+
+  outputs.push_back({{2, 3, 4},
+                     {5, 6, 7, 8,
+                      9, 10, 11, 12,
+                      13, 14, 15, 16,
+
+                      21, 22, 23, 24,
+                      25, 26, 27, 28,
+                      29, 30, 31, 32}});
+
+  RunTest<uint8_t>(axis, splits, input, outputs, false);
+}
+
+// test split for uint8_t data on the last axis equally
+TEST(SplitOperatorTest, Uint8NegativeAxis) {
+  const int64_t axis = -1;
+  std::vector<ShapeAndData<uint8_t>> outputs;
+
+  ShapeAndData<uint8_t> input = {{2, 4},
+                                 {1, 2, 3, 4,
+                                  5, 6, 7, 8}};
+
+  outputs.push_back({{2, 2},
+                     {1, 2,
+                      5, 6}});
+
+  outputs.push_back({{2, 2},
+                     {3, 4,
+                      7, 8}});
+
+  RunTest<uint8_t>(axis, {}, input, outputs, false);
+}
+
+TEST(SplitOperatorTest, MissingOptionalInputAdded) {
+  const int64_t axis = 1;  // split last axis equally
+  std::vector<ShapeAndFloatData> outputs;
+
+  // input shape and data
+  ShapeAndFloatData input = {{2, 4},
+                             {1.f, 2.f, 3.f, 4.f,
+                              5.f, 6.f, 7.f, 8.f}};
+
+  outputs.push_back({{2, 2},
+                     {1.f, 2.f,
+                      5.f, 6.f}});
+
+  outputs.push_back({{2, 2},
+                     {3.f, 4.f,
+                      7.f, 8.f}});
+
+  RunTest<float>(axis, {}, input, outputs, false, false, true, false, {}, false);
+}
+
 }  // namespace test
 }  // namespace onnxruntime

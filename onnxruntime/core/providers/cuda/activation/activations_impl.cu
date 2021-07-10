@@ -10,13 +10,6 @@ namespace onnxruntime {
 namespace cuda {
 
 template <typename T>
-struct OP_Affine : public CtxAffine {
-  __device__ __inline__ T operator()(const T& a) const {
-    return a * (T)alpha + (T)beta;
-  }
-};
-
-template <typename T>
 struct OP_Elu : public CtxElu {
   __device__ __inline__ T operator()(const T& a) const {
     return a > (T)0 ? a : (T)alpha * (_Exp(a) - (T)1);
@@ -38,26 +31,9 @@ struct OP_LeakyRelu : public CtxLeakyRelu {
 };
 
 template <typename T>
-struct OP_ParametricSoftplus : public CtxParametricSoftplus {
-  __device__ __inline__ T operator()(const T& a) const {
-    if (a > (T)0)
-      return (T)alpha * (a * (T)beta + _Log(_Exp(-a * (T)beta) + (T)1));
-    else
-      return (T)alpha * _Log(_Exp(a * (T)beta) + (T)1);
-  }
-};
-
-template <typename T>
 struct OP_Relu : public CtxRelu {
   __device__ __inline__ T operator()(const T& a) const {
     return _Max(a, (T)0);
-  }
-};
-
-template <typename T>
-struct OP_ScaledTanh : public CtxScaledTanh {
-  __device__ __inline__ T operator()(const T& a) const {
-    return (T)alpha * _Tanh(a * (T)beta);
   }
 };
 
@@ -108,18 +84,26 @@ struct OP_ThresholdedRelu : public CtxThresholdedRelu {
 
 #define UNARY_ACTIVATION_IMPL(name)                                        \
   UNARY_ACTIVATION_IMPL_DECLARATION(name) {                                \
-    UnaryElementWiseImpl(input_data,                                       \
+    UnaryElementWiseImpl(stream,                                           \
+                         input_data,                                       \
                          output_data,                                      \
                          *reinterpret_cast<const OP_##name<T>*>(func_ctx), \
                          count);                                           \
   }
 
 #define SPECIALIZED_UNARY_ACTIVATION_IMPL(name, T) \
-  template void Impl_##name<T>(const T* input_data, T* output_data, const Ctx##name* func_ctx, size_t count);
+  template void Impl_##name<T>(cudaStream_t stream, const T* input_data, T* output_data, const Ctx##name* func_ctx, size_t count);
 
-#define SPECIALIZED_UNARY_ACTIVATIONL_HFD(name)  \
-  SPECIALIZED_UNARY_ACTIVATION_IMPL(name, half)  \
-  SPECIALIZED_UNARY_ACTIVATION_IMPL(name, float) \
+#if CUDA_VERSION >= 11000 && (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#define SPECIALIZED_UNARY_ACTIVATION_IMPL_BF16(name) SPECIALIZED_UNARY_ACTIVATION_IMPL(name, nv_bfloat16)
+#else
+#define SPECIALIZED_UNARY_ACTIVATION_IMPL_BF16(name)
+#endif
+
+#define SPECIALIZED_UNARY_ACTIVATIONL_HFD(name)   \
+  SPECIALIZED_UNARY_ACTIVATION_IMPL(name, half)   \
+  SPECIALIZED_UNARY_ACTIVATION_IMPL_BF16(name)    \
+  SPECIALIZED_UNARY_ACTIVATION_IMPL(name, float)  \
   SPECIALIZED_UNARY_ACTIVATION_IMPL(name, double)
 
 #define UNARY_ACTIVATION_OP_NAME(name) \

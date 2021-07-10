@@ -3,67 +3,43 @@
 
 #pragma once
 
-#include <functional>
-#include <map>
-#include <string>
-#include <cstring>
-#include <type_traits>
-
 #include "core/common/common.h"
-#include "core/common/exceptions.h"
-#include "core/common/status.h"
 #include "core/framework/fence.h"
 #include "core/session/onnxruntime_c_api.h"
+#include "ortdevice.h"
+#include "ortmemoryinfo.h"
 
-struct OrtAllocatorInfo {
-  // use string for name, so we could have customized allocator in execution provider.
-  const char* name;
-  int id;
-  OrtMemType mem_type;
-  OrtAllocatorType type;
+// This configures the arena based allocator used by ORT
+// See docs/C_API.md for details on what these mean and how to choose these values
+struct OrtArenaCfg {
+  OrtArenaCfg() : max_mem(0),
+                  arena_extend_strategy(-1),
+                  initial_chunk_size_bytes(-1),
+                  max_dead_bytes_per_chunk(-1),
+                  initial_growth_chunk_size_bytes(-1) {}
+  OrtArenaCfg(size_t max_mem, int arena_extend_strategy, int initial_chunk_size_bytes,
+              int max_dead_bytes_per_chunk, int initial_growth_chunk_size_bytes)
+      : max_mem(max_mem),
+        arena_extend_strategy(arena_extend_strategy),
+        initial_chunk_size_bytes(initial_chunk_size_bytes),
+        max_dead_bytes_per_chunk(max_dead_bytes_per_chunk),
+        initial_growth_chunk_size_bytes(initial_growth_chunk_size_bytes) {}
 
-  constexpr OrtAllocatorInfo(const char* name1, OrtAllocatorType type, int id1 = 0, OrtMemType mem_type1 = OrtMemTypeDefault)
-#if (defined(__GNUC__) || defined(__clang__))
-      __attribute__((nonnull))
-#endif
-      : name(name1),
-        id(id1),
-        mem_type(mem_type1),
-        type(type) {
-  }
-
-  inline bool operator==(const OrtAllocatorInfo& other) const {
-    return mem_type == other.mem_type && type == other.type && id == other.id && strcmp(name, other.name) == 0;
-  }
-
-  // To make OrtAllocatorInfo become a valid key in std map
-  inline bool operator<(const OrtAllocatorInfo& other) const {
-    if (type != other.type)
-      return type < other.type;
-    if (mem_type != other.mem_type)
-      return mem_type < other.mem_type;
-    if (id != other.id)
-      return id < other.id;
-
-    return strcmp(name, other.name) < 0;
-  }
-
-  inline std::string ToString() const {
-    std::ostringstream ostr;
-    ostr << "OrtAllocatorInfo: ["
-         << " name:" << name
-         << " id:" << id
-         << " mem_type:" << mem_type
-         << " type:" << type
-         << "]";
-    return ostr.str();
-  }
+  size_t max_mem;                       // use 0 to allow ORT to choose the default
+  int arena_extend_strategy;            // use -1 to allow ORT to choose the default, 0 = kNextPowerOfTwo, 1 = kSameAsRequested
+  int initial_chunk_size_bytes;         // use -1 to allow ORT to choose the default
+  int max_dead_bytes_per_chunk;         // use -1 to allow ORT to choose the default
+  int initial_growth_chunk_size_bytes;  // use -1 to allow ORT to choose the default
 };
-
-std::ostream& operator<<(std::ostream& out, const OrtAllocatorInfo& info);
 
 namespace onnxruntime {
 constexpr const char* CPU = "Cpu";
+constexpr const char* CUDA = "Cuda";
+constexpr const char* CUDA_PINNED = "CudaPinned";
+constexpr const char* MIGRAPHX = "MIGraphX";
+constexpr const char* MIGRAPHX_PINNED = "MIGraphXPinned";
+
+constexpr size_t kAllocAlignment = 256;
 
 // forward declaration
 class SessionState;
@@ -73,10 +49,14 @@ using IAllocatorUniquePtr = std::unique_ptr<T, std::function<void(T*)>>;
 
 class IAllocator {
  public:
+  IAllocator(const OrtMemoryInfo& info) : memory_info_(info) {}
   virtual ~IAllocator() = default;
+  /**
+  @remarks Use SafeInt when calculating the size of memory to allocate using Alloc.
+  */
   virtual void* Alloc(size_t size) = 0;
   virtual void Free(void* p) = 0;
-  virtual const OrtAllocatorInfo& Info() const = 0;
+  const OrtMemoryInfo& Info() const { return memory_info_; };
 
   /**
      optional CreateFence interface, as provider like DML has its own fence
@@ -84,19 +64,32 @@ class IAllocator {
   virtual FencePtr CreateFence(const SessionState* /*unused*/) { return nullptr; }
 
   static bool CalcMemSizeForArray(size_t nmemb, size_t size, size_t* out) noexcept {
-    return CalcMemSizeForArrayWithAlignment<0>(nmemb, size, out);
+    return CalcMemSizeForArrayWithAlignment(nmemb, size, 0, out);
   }
 
   /**
-   * https://cwe.mitre.org/data/definitions/190.html
+  * Calculate the memory size for an array. The size is bounds checked using SafeInt. 
    * \tparam alignment must be power of 2
-   * \param nmemb
-   * \param size
-   * \param out
+   * \param nmemb Number of members or elements in the array
+   * \param size Size of each element
+   * \param out Total size required after any alignment is applied
    * \return true, successful. false, overflow
+   */
+  static bool CalcMemSizeForArrayWithAlignment(size_t nmemb, size_t size, size_t alignment, size_t* out) noexcept ORT_MUST_USE_RESULT;
+
+  /**
+   * https://cwe.mitre.org/data/definitions/190.html
+   * \param alignment must be power of 2
+   * \param nmemb Number of members or elements in the array
+   * \param size Size of each element
+   * \param out Total size required after any alignment is applied
+   * \return true, successful. false, overflow
+   * \remarks This was the original API and was implemented in the header. Replaced with the above version 
+   *          implemented in the .cc file so that the SafeInt dependency is internal.
    */
   template <size_t alignment>
   static bool CalcMemSizeForArrayWithAlignment(size_t nmemb, size_t size, size_t* out) noexcept ORT_MUST_USE_RESULT;
+
   /**
    * allocate memory for an array which has nmemb items of data, each size bytes long
    */
@@ -113,7 +106,7 @@ class IAllocator {
   template <size_t alignment>
   void* AllocArrayWithAlignment(size_t nmemb, size_t size) {
     size_t len;
-    if (!CalcMemSizeForArrayWithAlignment<alignment>(nmemb, size, &len))
+    if (!CalcMemSizeForArrayWithAlignment(nmemb, size, alignment, &len))
       return nullptr;
     return Alloc(len);
   }
@@ -137,55 +130,54 @@ class IAllocator {
     if (!std::is_void<T>::value) {
       // sizeof(void) isn't valid, but the compiler isn't smart enough to ignore that this line isn't
       // reachable if T is void. use std::conditional to 'use' void* in the sizeof call
-      if (!CalcMemSizeForArray(count_or_bytes, sizeof(typename std::conditional<std::is_void<T>::value, void*, T>::type),
+      if (!CalcMemSizeForArray(count_or_bytes,
+                               sizeof(typename std::conditional<std::is_void<T>::value, void*, T>::type),
                                &alloc_size)) return nullptr;
     }
+
     return IAllocatorUniquePtr<T>{
         static_cast<T*>(allocator->Alloc(alloc_size)),  // allocate
-        [=](T* ptr) { allocator->Free(ptr); }};         // capture IAllocator so it's always valid, and use as deleter
+        [=](T* ptr) {                                   // capture 'allocator' by value so it's always valid
+          allocator->Free(ptr);
+        }};
   }
+
+ private:
+  OrtMemoryInfo memory_info_;
 };
 
 template <size_t alignment>
 bool IAllocator::CalcMemSizeForArrayWithAlignment(size_t nmemb, size_t size, size_t* out) noexcept {
-  static constexpr size_t max_allowed = (static_cast<size_t>(1) << (static_cast<size_t>(std::numeric_limits<size_t>::digits >> 1))) - alignment;
-  static constexpr size_t max_size = std::numeric_limits<size_t>::max() - alignment;
-  static constexpr size_t alignment_mask = alignment - 1;
-  //Indeed, we only need to check if max_size / nmemb < size
-  //max_allowed is for avoiding unnecessary DIV.
-  if (nmemb >= max_allowed && max_size / nmemb < size) {
-    return false;
-  }
-  if (size >= max_allowed &&
-      nmemb > 0 && max_size / nmemb < size) {
-    return false;
-  }
-  if (alignment == 0)
-    *out = size * nmemb;
-  else
-    *out = (size * nmemb + alignment_mask) & ~static_cast<size_t>(alignment_mask);
-  return true;
+  return CalcMemSizeForArrayWithAlignment(nmemb, size, alignment, out);
 }
 
-/**
-   The resource allocator on a physical device.
-   This allocator will directly allocate resource from system call
-*/
-class IDeviceAllocator : public IAllocator {
+class CPUAllocator : public IAllocator {
  public:
-  ~IDeviceAllocator() override = default;
-  void* Alloc(size_t size) override = 0;
-  void Free(void* p) override = 0;
-  const OrtAllocatorInfo& Info() const override = 0;
-  virtual bool AllowsArena() const { return true; }
-};
+  explicit CPUAllocator(const OrtMemoryInfo& memory_info) : IAllocator(memory_info) {}
 
-class CPUAllocator : public IDeviceAllocator {
- public:
+  CPUAllocator() : IAllocator(OrtMemoryInfo(CPU, OrtAllocatorType::OrtDeviceAllocator)) {}
+
   void* Alloc(size_t size) override;
   void Free(void* p) override;
-  const OrtAllocatorInfo& Info() const override;
 };
+
+#if defined(USE_MIMALLOC_ARENA_ALLOCATOR)
+class MiMallocAllocator : public IAllocator {
+ public:
+  explicit MiMallocAllocator(const OrtMemoryInfo& memory_info) : IAllocator(memory_info) {}
+  MiMallocAllocator() : IAllocator(OrtMemoryInfo(CPU, OrtAllocatorType::OrtDeviceAllocator)) {}
+
+  void* Alloc(size_t size) override;
+  void Free(void* p) override;
+};
+
+#endif
+
+#if defined(USE_MIMALLOC_ARENA_ALLOCATOR)
+using TAllocator = MiMallocAllocator;
+#else
+using TAllocator = CPUAllocator;
+#endif
 
 using AllocatorPtr = std::shared_ptr<IAllocator>;
 

@@ -10,6 +10,7 @@
 #endif
 #include "core/providers/cpu/controlflow/scan.h"
 #include "core/providers/cpu/controlflow/scan_utils.h"
+#include "core/providers/cpu/controlflow/utils.h"
 
 #include "core/framework/framework_common.h"
 #include "core/framework/op_kernel_context_internal.h"
@@ -86,15 +87,16 @@ class Scan8Impl {
  public:
   Scan8Impl(OpKernelContextInternal& context,
             const SessionState& session_state,
-            int64_t num_scan_inputs,
-            const std::vector<int64_t>& directions);
+            const Scan<8>::Info& info,
+            const std::vector<int64_t>& directions,
+            const scan::detail::DeviceHelpers& device_helpers);
 
   // Initialize by validating all the inputs, and allocating the output tensors
   Status Initialize();
 
   // Execute the batch, by iterating the sequence in each batch entry
   // and calling the subgraph with each item in the sequence.
-  Status Execute();
+  Status Execute(const FeedsFetchesManager& cached_ffm);
 
  private:
   // validate inputs and setup batch size and max sequence length.
@@ -105,16 +107,12 @@ class Scan8Impl {
   Status AllocateOutputTensors();
   Status CreateLoopStateVariables(std::vector<std::vector<LoopStateVariable>>& loop_state_variables);
 
-  using ConstTensorSlicerIterators = std::vector<MLValueTensorSlicer<const MLValue>::Iterator>;
-  using MutableTensorSlicerIterators = std::vector<MLValueTensorSlicer<MLValue>::Iterator>;
+  using ConstTensorSlicerIterators = std::vector<OrtValueTensorSlicer<const OrtValue>::Iterator>;
+  using MutableTensorSlicerIterators = std::vector<OrtValueTensorSlicer<OrtValue>::Iterator>;
 
   OpKernelContextInternal& context_;
   const SessionState& session_state_;
-  const GraphViewer& subgraph_;
-
-  int num_loop_state_variables_;
-  int num_variadic_inputs_;
-  int num_variadic_outputs_;
+  const Scan<8>::Info& info_;
 
   int64_t batch_size_ = -1;
   int64_t max_sequence_len_ = -1;
@@ -123,14 +121,15 @@ class Scan8Impl {
   const Tensor* sequence_lens_tensor_;
   std::vector<int64_t> sequence_lens_;
 
-  std::vector<std::string> subgraph_output_names_;
   std::vector<std::unique_ptr<OutputIterator>> output_iterators_;
 
-  std::unordered_map<std::string, const MLValue*> implicit_inputs_;
+  const std::vector<const OrtValue*>& implicit_inputs_;
+
+  const scan::detail::DeviceHelpers& device_helpers_;
 };
 
 template <>
-Scan<8>::Scan(const OpKernelInfo& info) : OpKernel(info) {
+void Scan<8>::Init(const OpKernelInfo& info) {
   // make sure the attribute was present even though we don't need it here.
   // The GraphProto is loaded as a Graph instance by main Graph::Resolve,
   // and a SessionState instance for executing the subgraph is created by InferenceSession.
@@ -142,58 +141,71 @@ Scan<8>::Scan(const OpKernelInfo& info) : OpKernel(info) {
   ORT_ENFORCE(info.GetAttr<int64_t>("num_scan_inputs", &num_scan_inputs_).IsOK());
 
   ReadDirections(info, "directions", input_directions_, num_scan_inputs_);
+
+  device_helpers_.transpose_func = [](const std::vector<size_t>&, const Tensor&, Tensor&) -> Status {
+    ORT_NOT_IMPLEMENTED("Scan<8> spec does not support transpose of output. This should never be called.");
+  };
+
+  device_helpers_.set_data_to_zero_func = [](void* data, size_t size_in_bytes) -> Status {
+    memset(data, 0, size_in_bytes);
+    return Status::OK();
+  };
+}
+
+template <>
+Status Scan<8>::SetupSubgraphExecutionInfo(const SessionState& session_state,
+                                           const std::string& attribute_name,
+                                           const SessionState& subgraph_session_state) {
+  ORT_ENFORCE(info_ == nullptr, "SetupSubgraphExecutionInfo should only be called once for each subgraph.");
+  ORT_UNUSED_PARAMETER(attribute_name);
+
+  const auto& node = Node();
+  info_ = std::make_unique<Scan<8>::Info>(node, subgraph_session_state.GetGraphViewer(),
+                                                  static_cast<int>(num_scan_inputs_));
+
+  auto status = scan::detail::CreateFeedsFetchesManager(node, *info_, session_state, subgraph_session_state,
+                                                        /* is_v8 */ true, feeds_fetches_manager_);
+
+  return status;
 }
 
 template <>
 Status Scan<8>::Compute(OpKernelContext* ctx) const {
+  ORT_ENFORCE(feeds_fetches_manager_ && info_,
+              "CreateFeedsFetchesManager must be called prior to execution of graph.");
+
   auto ctx_internal = static_cast<OpKernelContextInternal*>(ctx);
   auto* session_state = ctx_internal->SubgraphSessionState("body");
   ORT_ENFORCE(session_state, "Subgraph SessionState was not found for 'body' attribute.");
 
-  // TODO:
-  //       Consider how usage of ExecutionFrame and SequentialExecutor can be optimized
-  //         - initial implementation is focused on making it work, rather than optimizing.
-
-  Scan8Impl scan_impl{*ctx_internal, *session_state, num_scan_inputs_, input_directions_};
+  Scan8Impl scan_impl{*ctx_internal, *session_state, *info_, input_directions_, device_helpers_};
 
   auto status = scan_impl.Initialize();
   ORT_RETURN_IF_ERROR(status);
 
-  status = scan_impl.Execute();
+  status = scan_impl.Execute(*feeds_fetches_manager_);
 
   return status;
 }
 
 Scan8Impl::Scan8Impl(OpKernelContextInternal& context,
                      const SessionState& session_state,
-                     int64_t num_scan_inputs,
-                     const std::vector<int64_t>& directions)
-    : context_{context},
-      session_state_{session_state},
-      subgraph_{*session_state.GetGraphViewer()},
-      directions_{directions},
-      implicit_inputs_{context_.GetImplicitInputs()} {
+                     const Scan<8>::Info& info,
+                     const std::vector<int64_t>& directions,
+                     const scan::detail::DeviceHelpers& device_helpers)
+    : context_(context),
+      session_state_(session_state),
+      info_(info),
+      directions_(directions),
+      implicit_inputs_(context_.GetImplicitInputs()),
+      device_helpers_(device_helpers) {
   // optional first input so may be nullptr
   sequence_lens_tensor_ = context.Input<Tensor>(0);
-
-  num_variadic_inputs_ = context_.NumVariadicInputs(1);
-  num_variadic_outputs_ = context_.OutputCount();
-
-  num_loop_state_variables_ = num_variadic_inputs_ - gsl::narrow_cast<int>(num_scan_inputs);
 }
 
 Status Scan8Impl::Initialize() {
   auto status = ValidateInput();
   ORT_RETURN_IF_ERROR(status);
-
-  auto& subgraph_outputs = subgraph_.GetOutputs();
-  subgraph_output_names_.reserve(subgraph_outputs.size());
-
-  // save list of subgraph output names in their provided order to use when fetching the results
-  // from each subgraph execution. the Scan outputs will match this order.
-  for (auto& output : subgraph_outputs) {
-    subgraph_output_names_.push_back(output->Name());
-  }
 
   status = AllocateOutputTensors();
   ORT_RETURN_IF_ERROR(status);
@@ -208,9 +220,9 @@ static const Tensor& GetSubgraphInputTensor(const OpKernelContext& context, int 
   return *context.Input<Tensor>(index + 1);
 }
 
-// get the Scan input that is used in a call to the subgraph as an MLValue,
+// get the Scan input that is used in a call to the subgraph as an OrtValue,
 // skipping over the optional arg to the Scan operator
-static const MLValue& GetSubgraphInputMLValue(const OpKernelContextInternal& context, int index) {
+static const OrtValue& GetSubgraphInputMLValue(const OpKernelContextInternal& context, int index) {
   // skip the optional sequence_lens input
   return *context.GetInputMLValue(index + 1);
 }
@@ -263,25 +275,18 @@ Status Scan8Impl::ValidateSubgraphInput(int start_input, int end_input, bool is_
 }
 
 Status Scan8Impl::ValidateInput() {
-  auto& graph_inputs = subgraph_.GetInputs();
-  auto num_graph_inputs = graph_inputs.size();
-
-  if (num_graph_inputs != static_cast<size_t>(num_variadic_inputs_)) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "The subgraph in 'body' expects ", num_graph_inputs,
-                           " inputs but Scan was only given ", num_variadic_inputs_);
-  }
+  auto& graph_inputs = info_.subgraph.GetInputs();
 
   // process any loop state variables, which will set the batch size
-  auto status = ValidateSubgraphInput(0, num_loop_state_variables_, true, graph_inputs);
+  auto status = ValidateSubgraphInput(0, info_.num_loop_state_variables, true, graph_inputs);
   ORT_RETURN_IF_ERROR(status);
 
   // process the scan inputs. sets/validates batch size and sequence length
-  status = ValidateSubgraphInput(num_loop_state_variables_, num_variadic_inputs_, false, graph_inputs);
+  status = ValidateSubgraphInput(info_.num_loop_state_variables, info_.num_variadic_inputs, false, graph_inputs);
   ORT_RETURN_IF_ERROR(status);
 
   if (sequence_lens_tensor_ != nullptr) {
     auto num_entries = sequence_lens_tensor_->Shape().Size();
-
     if (num_entries != batch_size_) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "sequence_lens length of ", num_entries,
                              " did not match batch size of ", batch_size_);
@@ -290,8 +295,8 @@ Status Scan8Impl::ValidateInput() {
     auto d = sequence_lens_tensor_->DataAsSpan<int64_t>();
     sequence_lens_.assign(d.cbegin(), d.cend());
 
-    if (std::all_of(sequence_lens_.cbegin(), sequence_lens_.cend(),
-                    [this](int64_t value) { return value > 0 && value <= max_sequence_len_; }) == false) {
+    if (!std::all_of(sequence_lens_.cbegin(), sequence_lens_.cend(),
+                     [this](int64_t value) { return value > 0 && value <= max_sequence_len_; })) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                              "Invalid entries in sequence_lens. Max sequence length was ", max_sequence_len_);
     }
@@ -305,23 +310,25 @@ Status Scan8Impl::ValidateInput() {
 
 Status Scan8Impl::AllocateOutputTensors() {
   Status status = Status::OK();
-  auto& graph_outputs = subgraph_.GetOutputs();
+  auto& graph_outputs = info_.subgraph.GetOutputs();
 
-  if (graph_outputs.size() != static_cast<size_t>(num_variadic_outputs_)) {
+  if (graph_outputs.size() != static_cast<size_t>(info_.num_outputs)) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Subgraph in 'body' produces ", graph_outputs.size(),
-                           " outputs but Scan expects ", num_variadic_outputs_);
+                           " outputs but Scan expects ", info_.num_outputs);
   }
 
   std::unique_ptr<OutputIterator> output_iter;
 
-  for (int i = 0; i < num_loop_state_variables_; ++i) {
-    status = AllocateOutput(context_, subgraph_, i, true, batch_size_, max_sequence_len_, output_iter);
+  for (int i = 0; i < info_.num_loop_state_variables; ++i) {
+    status = AllocateOutput(context_, info_.subgraph, i, true, batch_size_, max_sequence_len_, output_iter,
+                            device_helpers_.create_mutable_slicer_func, device_helpers_.set_data_to_zero_func);
     ORT_RETURN_IF_ERROR(status);
     output_iterators_.push_back(std::move(output_iter));
   }
 
-  for (int i = num_loop_state_variables_, end = num_variadic_outputs_; i < end; ++i) {
-    status = AllocateOutput(context_, subgraph_, i, false, batch_size_, max_sequence_len_, output_iter);
+  for (int i = info_.num_loop_state_variables, end = info_.num_outputs; i < end; ++i) {
+    status = AllocateOutput(context_, info_.subgraph, i, false, batch_size_, max_sequence_len_, output_iter,
+                            device_helpers_.create_mutable_slicer_func, device_helpers_.set_data_to_zero_func);
     ORT_RETURN_IF_ERROR(status);
     output_iterators_.push_back(std::move(output_iter));
   }
@@ -337,17 +344,17 @@ Status Scan8Impl::CreateLoopStateVariables(std::vector<std::vector<LoopStateVari
   // 2. For each batch item, create the LoopStateVariable instances that can be used to pass state between
   //    each iteration of the subgraph. This minimizes copying of data during each iteration.
 
-  std::vector<MLValueTensorSlicer<const MLValue>::Iterator> loop_state_input_iterators;
-  loop_state_input_iterators.reserve(num_loop_state_variables_);
+  std::vector<OrtValueTensorSlicer<const OrtValue>::Iterator> loop_state_input_iterators;
+  loop_state_input_iterators.reserve(info_.num_loop_state_variables);
 
   // create the input and output slice iterator for each loop state variable.
-  for (int i = 0; i < num_loop_state_variables_; ++i) {
-    const MLValue& mlvalue = GetSubgraphInputMLValue(context_, i);
-    MLValue* p_mlvalue = context_.GetOutputMLValue(i);
+  for (int i = 0; i < info_.num_loop_state_variables; ++i) {
+    const OrtValue& ort_value = GetSubgraphInputMLValue(context_, i);
+    OrtValue* p_mlvalue = context_.GetOutputMLValue(i);
 
-    ORT_ENFORCE(p_mlvalue, "Output MLValue has not been created for loop state variable output ", i);
+    ORT_ENFORCE(p_mlvalue, "Output OrtValue has not been created for loop state variable output ", i);
 
-    loop_state_input_iterators.push_back(MLValueTensorSlicer<const MLValue>::Create(mlvalue).begin());
+    loop_state_input_iterators.push_back(device_helpers_.create_const_slicer_func(ort_value, 0, 0).begin());
   }
 
   batch_loop_state_variables.clear();
@@ -360,13 +367,13 @@ Status Scan8Impl::CreateLoopStateVariables(std::vector<std::vector<LoopStateVari
   // setup the loop state variables for each batch row
   for (int64_t b = 0; b < batch_size_; ++b) {
     std::vector<LoopStateVariable>& variables = batch_loop_state_variables[b];
-    variables.reserve(num_loop_state_variables_);
+    variables.reserve(info_.num_loop_state_variables);
 
-    for (int i = 0; i < num_loop_state_variables_; ++i) {
+    for (int i = 0; i < info_.num_loop_state_variables; ++i) {
       auto& input_iter = loop_state_input_iterators[i];
       auto& output_iter = *output_iterators_[i];
 
-      variables.push_back(LoopStateVariable(*input_iter, *output_iter, sequence_lens_[b], alloc));
+      variables.emplace_back(*input_iter, *output_iter, sequence_lens_[b], alloc);
 
       ++input_iter;
       ++output_iter;
@@ -376,7 +383,7 @@ Status Scan8Impl::CreateLoopStateVariables(std::vector<std::vector<LoopStateVari
   return status;
 }
 
-Status Scan8Impl::Execute() {
+Status Scan8Impl::Execute(const FeedsFetchesManager& ffm) {
   Status status = Status::OK();
 
   // for each batch item, std::vector of LoopStateVariables
@@ -387,19 +394,19 @@ Status Scan8Impl::Execute() {
   for (int64_t b = 0; b < batch_size_; ++b) {
     auto sequence_len = sequence_lens_[b];
 
-    // Setup input MLValue streams
-    std::vector<MLValueTensorSlicer<const MLValue>::Iterator> scan_input_stream_iterators;
-    scan_input_stream_iterators.reserve(num_variadic_inputs_ - num_loop_state_variables_);
+    // Setup input OrtValue streams
+    std::vector<OrtValueTensorSlicer<const OrtValue>::Iterator> scan_input_stream_iterators;
+    scan_input_stream_iterators.reserve(info_.num_variadic_inputs - info_.num_loop_state_variables);
 
-    for (int i = num_loop_state_variables_, end = num_variadic_inputs_; i < end; ++i) {
-      const auto& mlvalue = GetSubgraphInputMLValue(context_, i);
+    for (int i = info_.num_loop_state_variables, end = info_.num_variadic_inputs; i < end; ++i) {
+      const auto& ort_value = GetSubgraphInputMLValue(context_, i);
 
       // forward
-      if (directions_[i - num_loop_state_variables_] == static_cast<int64_t>(ScanDirection::kForward)) {
-        // the iterator is self contained, so we don't need to keep the MLValueTensorSlicer instance around
-        scan_input_stream_iterators.push_back(MLValueTensorSlicer<const MLValue>::Create(mlvalue, 1, b).begin());
+      if (directions_[i - info_.num_loop_state_variables] == static_cast<int64_t>(ScanDirection::kForward)) {
+        // the iterator is self contained, so we don't need to keep the OrtValueTensorSlicer instance around
+        scan_input_stream_iterators.push_back(device_helpers_.create_const_slicer_func(ort_value, 1, b).begin());
       } else {  // reverse
-        scan_input_stream_iterators.push_back(MLValueTensorSlicer<const MLValue>::Create(mlvalue, 1, b).rbegin());
+        scan_input_stream_iterators.push_back(device_helpers_.create_const_slicer_func(ort_value, 1, b).rbegin());
         // need to skip past the empty entries at the end of the input if sequence length is short
         auto offset = max_sequence_len_ - sequence_len;
         if (offset > 0) {
@@ -410,14 +417,13 @@ Status Scan8Impl::Execute() {
     }
 
     // Call the subgraph for each item in the sequence
-    status = IterateSequence(context_, session_state_, subgraph_, batch_loop_state_variables[b],
-                             scan_input_stream_iterators, sequence_len, num_loop_state_variables_,
-                             num_variadic_inputs_, num_variadic_outputs_, implicit_inputs_,
-                             subgraph_output_names_, output_iterators_);
+    status = IterateSequence(context_, session_state_, batch_loop_state_variables[b], scan_input_stream_iterators,
+                             sequence_len, info_.num_loop_state_variables, info_.num_variadic_inputs, info_.num_outputs,
+                             implicit_inputs_, output_iterators_, ffm);
 
     // zero out any remaining values in the sequence
     for (int64_t i = sequence_len; i < max_sequence_len_; ++i) {
-      for (int output = num_loop_state_variables_; output < num_variadic_outputs_; ++output) {
+      for (int output = info_.num_loop_state_variables; output < info_.num_outputs; ++output) {
         auto& iterator = *output_iterators_[output];
         iterator.ZeroOutCurrent();
         ++iterator;

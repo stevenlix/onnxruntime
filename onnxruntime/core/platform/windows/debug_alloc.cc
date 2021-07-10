@@ -11,8 +11,7 @@
 // It creates & destroys itself in init_seg(lib) so it should scope all user code
 //
 #ifndef NDEBUG
-// TVM need to run with shared CRT, so won't work with debug heap alloc
-#ifndef USE_TVM
+#ifdef ONNXRUNTIME_ENABLE_MEMLEAK_CHECK
 constexpr int c_callstack_limit = 16;  // Maximum depth of callstack in leak trace
 #define VALIDATE_HEAP_EVERY_ALLOC 0    // Call HeapValidate on every new/delete
 
@@ -35,6 +34,10 @@ constexpr int c_callstack_limit = 16;  // Maximum depth of callstack in leak tra
 #include "debug_alloc.h"
 #include <DbgHelp.h>
 #pragma comment(lib, "Dbghelp.lib")
+
+// If you are seeing errors of
+// "Error LNK2005: "void __cdecl operator delete(void *)" (??3@YAXPEAX@Z) already defined in LIBCMTD.lib(delete_scalar.obj)"
+// Please read:https://developercommunity.visualstudio.com/content/problem/534202/visual-studio-2017-msvcrtlib-link-error.html
 
 _Ret_notnull_ _Post_writable_byte_size_(size) void* operator new(size_t size) { return DebugHeapAlloc(size, 1); }
 _Ret_notnull_ _Post_writable_byte_size_(size) void* operator new[](size_t size) { return DebugHeapAlloc(size, 1); }
@@ -74,7 +77,7 @@ struct SymbolHelper {
       return;
     }
 
-    _snprintf_s(buffer, _TRUNCATE, "%s(%d): %s", line.FileName, line.LineNumber, symbol.Name);
+    _snprintf_s(buffer, _TRUNCATE, "%s(%d): %s", line.FileName, static_cast<int>(line.LineNumber), symbol.Name);
     string.append(buffer);
   }
 
@@ -204,7 +207,15 @@ Memory_LeakCheck::~Memory_LeakCheck() {
     //     "Static mutexes are leaked intentionally. It is not thread-safe to try to clean them up."
     // Which explains this leak inside of: void Mutex::ThreadSafeLazyInit()
     //     critical_section_ = new CRITICAL_SECTION;
-    if (string.find("testing::internal::Mutex::ThreadSafeLazyInit") == std::string::npos &&
+    //
+    // in google/re2 re2.cc initializes leaking singletons
+    //     std::call_once(empty_once, []() {
+    //     empty_string = new string;
+    //     empty_named_groups = new std::map<string, int>;
+    //     empty_group_names = new std::map<int, string>; });
+    if (string.find("RtlRunOnceExecuteOnce") == std::string::npos &&
+        string.find("re2::RE2::Init") == std::string::npos &&
+        string.find("testing::internal::Mutex::ThreadSafeLazyInit") == std::string::npos &&
         string.find("testing::internal::ThreadLocalRegistryImpl::GetThreadLocalsMapLocked") == std::string::npos &&
         string.find("testing::internal::ThreadLocalRegistryImpl::GetValueOnCurrentThread") == std::string::npos) {
       if (leaked_bytes == 0)
@@ -222,15 +233,11 @@ Memory_LeakCheck::~Memory_LeakCheck() {
 
     std::string string;
     char buffer[1024];
-    _snprintf_s(buffer, _TRUNCATE, "%d bytes of memory leaked in %d allocations", leaked_bytes, leak_count);
+    _snprintf_s(buffer, _TRUNCATE, "%d bytes of memory leaked in %d allocations", static_cast<int>(leaked_bytes), static_cast<int>(leak_count));
     string.append(buffer);
 
-    // If we're being actively debugged, show a message box to get the dev's attention
-    if (IsDebuggerPresent())
-      MessageBoxA(nullptr, string.c_str(), "Warning", MB_OK | MB_ICONWARNING);
-    else {
-      // If we're on the command line (like on a build machine), output to the console and exit(-1)
-      std::cout << "\n----- MEMORY LEAKS: " << string.c_str() << "\n";
+    std::cout << "\n----- MEMORY LEAKS: " << string.c_str() << "\n";
+    if (!IsDebuggerPresent()) {
       exit(-1);
     }
 

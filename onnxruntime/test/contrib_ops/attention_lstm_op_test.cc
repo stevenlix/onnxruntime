@@ -103,35 +103,35 @@ static void RunAttnLstmTest(
     std::vector<int64_t> B_dims = {num_directions, 8 * hidden_size};
     test.AddInput<float>("B", B_dims, *B_data);
   } else {
-    test.AddMissingOptionalInput<float>();
+    test.AddOptionalInputEdge<float>();
   }
 
   if (sequence_lengths) {
     std::vector<int64_t> sequence_lens_dims{batch_size};
     test.AddInput<int>("sequence_lens", sequence_lens_dims, *sequence_lengths);
   } else {
-    test.AddMissingOptionalInput<int>();
+    test.AddOptionalInputEdge<int>();
   }
 
   if (initial_h_data && !initial_h_data->empty()) {
     std::vector<int64_t> initial_h_dims = {num_directions, batch_size, hidden_size};
     test.AddInput<float>("initial_h", initial_h_dims, *initial_h_data);
   } else {
-    test.AddMissingOptionalInput<float>();
+    test.AddOptionalInputEdge<float>();
   }
 
   if (initial_c_data && !initial_c_data->empty()) {
     std::vector<int64_t> initial_c_dims = {num_directions, batch_size, hidden_size};
     test.AddInput<float>("initial_c", initial_c_dims, *initial_c_data);
   } else {
-    test.AddMissingOptionalInput<float>();
+    test.AddOptionalInputEdge<float>();
   }
 
   if (P_data && !P_data->empty()) {
     std::vector<int64_t> P_dims = {num_directions, 3 * hidden_size};
     test.AddInput<float>("P", P_dims, *P_data);
   } else {
-    test.AddMissingOptionalInput<float>();
+    test.AddOptionalInputEdge<float>();
   }
 
   std::vector<int64_t> QW_dims{num_directions, hidden_size, am_attn_size};
@@ -150,14 +150,14 @@ static void RunAttnLstmTest(
     std::vector<int64_t> M_seq_dims{batch_size};
     test.AddInput<int>("memory_seq_lens", M_seq_dims, *memory_sequence_lengths);
   } else {
-    test.AddMissingOptionalInput<int>();
+    test.AddOptionalInputEdge<int>();
   }
 
   if (attn_layer_weights) {
     std::vector<int64_t> attn_layer_weight_dims{num_directions, memory_depth + hidden_size, aw_attn_size};
     test.AddInput<float>("AW", attn_layer_weight_dims, *attn_layer_weights);
   } else {
-    test.AddMissingOptionalInput<int>();
+    test.AddOptionalInputEdge<int>();
   }
 
   if (output_sequence != 0 && !Y_data.empty()) {
@@ -166,21 +166,21 @@ static void RunAttnLstmTest(
   } else {
     // add placeholder so node counts match as Y_h will always be the second Y_data,
     // so Y must exist as the first Y_data
-    test.AddMissingOptionalOutput<float>();
+    test.AddOptionalOutputEdge<float>();
   }
 
   if (!Y_h_data.empty()) {
     std::vector<int64_t> Y_h_dims{num_directions, batch_size, hidden_size};
     test.AddOutput<float>("Y_h", Y_h_dims, Y_h_data);
   } else {
-    test.AddMissingOptionalOutput<float>();
+    test.AddOptionalOutputEdge<float>();
   }
 
   if (!Y_c_data.empty()) {
     std::vector<int64_t> Y_c_dims{num_directions, batch_size, hidden_size};
     test.AddOutput<float>("Y_c", Y_c_dims, Y_c_data);
   } else {
-    test.AddMissingOptionalOutput<float>();
+    test.AddOptionalOutputEdge<float>();
   }
 
   test.Run();
@@ -197,7 +197,7 @@ static std::vector<T> ConcatDup(const std::vector<T>& src) {
 template <typename T>
 static std::vector<T> ConcatLastDim(const std::vector<T>& a, const std::vector<T>& b, int depth) {
   std::vector<T> dst(2 * a.size());
-  for (int s = 0; s < a.size(); s += depth) {
+  for (size_t s = 0; s < a.size(); s += depth) {
     std::copy(a.cbegin() + s, a.cbegin() + s + depth, dst.begin() + 2 * s);
     std::copy(b.cbegin() + s, b.cbegin() + s + depth, dst.begin() + 2 * s + depth);
   }
@@ -237,7 +237,7 @@ static std::vector<T> ConvertBatchSeqToSeqBatch(
 template <typename T>
 static std::vector<T> ConvertIcfoToIofc(const std::vector<T>& icfo, int cell_hidden_size) {
   std::vector<T> iofc(icfo.size());
-  for (int i = 0; i < icfo.size(); i += 4 * cell_hidden_size) {
+  for (size_t i = 0; i < icfo.size(); i += 4 * cell_hidden_size) {
     auto src = icfo.cbegin() + i;
     auto dst = iofc.begin() + i;
 

@@ -4,26 +4,37 @@
 #pragma once
 
 #include <string>
+#ifndef SHARED_PROVIDER
 #include "core/common/common.h"
 #include "core/common/exceptions.h"
 #include "core/framework/allocator.h"
 #include "core/framework/data_types.h"
 #include "core/framework/tensor.h"
+#include "core/framework/TensorSeq.h"
+#endif
 
 namespace onnxruntime {
+class SparseTensor;
+}  // namespace onnxruntime
+
 /**
    Represents both tensors and non-tensors.
 */
-class MLValue {
+struct OrtValue {
  public:
-  MLValue() : data_(nullptr) {}
-  virtual ~MLValue() = default;
+  OrtValue() : data_(nullptr) {}
+  ~OrtValue() = default;
 
-  MLValue(void* pData, MLDataType type, DeleteFunc deleter) {
+  OrtValue(void* pData, onnxruntime::MLDataType type, onnxruntime::DeleteFunc deleter) {
     Init(pData, type, deleter);
   }
 
-  void Init(void* pData, MLDataType type, DeleteFunc deleter) {
+  void Init(void* pData, onnxruntime::MLDataType type, onnxruntime::DeleteFunc deleter) {
+    data_.reset(pData, deleter);
+    type_ = type;
+  }
+
+  void Init(void* pData, onnxruntime::MLDataType type, const std::function<void(void*)>& deleter) {
     data_.reset(pData, deleter);
     type_ = type;
   }
@@ -34,39 +45,83 @@ class MLValue {
 
   template <typename T>
   const T& Get() const {
-    ORT_ENFORCE(DataTypeImpl::GetType<T>() == type_, DataTypeImpl::GetType<T>(), " != ", type_);
+    ORT_ENFORCE(onnxruntime::DataTypeImpl::GetType<T>() == type_, onnxruntime::DataTypeImpl::GetType<T>(), " != ", type_);
     return *static_cast<T*>(data_.get());
   }
 
   template <typename T>
   T* GetMutable() {
-    ORT_ENFORCE(DataTypeImpl::GetType<T>() == type_, DataTypeImpl::GetType<T>(), " != ", type_);
+    ORT_ENFORCE(onnxruntime::DataTypeImpl::GetType<T>() == type_, onnxruntime::DataTypeImpl::GetType<T>(), " != ", type_);
     return static_cast<T*>(data_.get());
   }
 
   bool IsTensor() const noexcept {
-    return DataTypeImpl::GetType<Tensor>() == type_;
+    return (type_ != nullptr && type_->IsTensorType());
   }
 
-  MLDataType Type() const {
+  bool IsTensorSequence() const noexcept {
+    return (type_ != nullptr && type_->IsTensorSequenceType());
+  }
+
+  bool IsSparseTensor() const noexcept {
+    return (type_ != nullptr && type_->IsSparseTensorType());
+  }
+
+  onnxruntime::MLDataType Type() const {
     return type_;
   }
 
-  Fence_t Fence() const {
+  onnxruntime::Fence_t Fence() const {
     return fence_.get();
   }
 
-  void SetFence(FencePtr fence) {
+  void SetFence(onnxruntime::FencePtr fence) {
     fence_ = fence;
   }
 
-  void ShareFenceWith(MLValue& v) {
+  void ShareFenceWith(OrtValue& v) {
     fence_ = v.fence_;
   }
 
  private:
   std::shared_ptr<void> data_;
-  MLDataType type_{nullptr};
-  FencePtr fence_;
+  onnxruntime::MLDataType type_{nullptr};
+  onnxruntime::FencePtr fence_;
 };
-}  // namespace onnxruntime
+
+template <>
+inline const onnxruntime::Tensor& OrtValue::Get<onnxruntime::Tensor>() const {
+  ORT_ENFORCE(IsTensor(), "Trying to get a Tensor, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return *static_cast<onnxruntime::Tensor*>(data_.get());
+}
+
+template <>
+inline onnxruntime::Tensor* OrtValue::GetMutable<onnxruntime::Tensor>() {
+  ORT_ENFORCE(IsTensor(), "Trying to get a Tensor, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return static_cast<onnxruntime::Tensor*>(data_.get());
+}
+
+template <>
+inline const onnxruntime::TensorSeq& OrtValue::Get<onnxruntime::TensorSeq>() const {
+  ORT_ENFORCE(IsTensorSequence(), "Trying to get a TensorSeq, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return *static_cast<onnxruntime::TensorSeq*>(data_.get());
+}
+
+template <>
+inline onnxruntime::TensorSeq* OrtValue::GetMutable<onnxruntime::TensorSeq>() {
+  ORT_ENFORCE(IsTensorSequence(), "Trying to get a TensorSeq, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return static_cast<onnxruntime::TensorSeq*>(data_.get());
+}
+
+template <>
+inline const onnxruntime::SparseTensor& OrtValue::Get<onnxruntime::SparseTensor>() const {
+  ORT_ENFORCE(IsSparseTensor(), "Trying to get a SparseTensor, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return *static_cast<onnxruntime::SparseTensor*>(data_.get());
+}
+
+template <>
+inline onnxruntime::SparseTensor* OrtValue::GetMutable<onnxruntime::SparseTensor>() {
+  ORT_ENFORCE(IsSparseTensor(), "Trying to get a SparseTensor, but got: ", onnxruntime::DataTypeImpl::ToString(type_));
+  return static_cast<onnxruntime::SparseTensor*>(data_.get());
+}
+

@@ -91,6 +91,7 @@ struct EventRecord {
   std::unordered_map<std::string, std::string> args;
 };
 }  // namespace profiling
+
 namespace logging {
 
 using Timestamp = std::chrono::time_point<std::chrono::system_clock>;
@@ -176,6 +177,12 @@ class LoggingManager final {
   static const Logger& DefaultLogger();
 
   /**
+     Change the minimum severity level for log messages to be output by the default logger.
+     @param severity The severity.
+  */
+  static void SetDefaultLoggerSeverity(Severity severity);
+
+  /**
      Logs a FATAL level message and creates an exception that can be thrown with error information.
      @param category The log category.
      @param location The location the log message was generated.
@@ -212,6 +219,7 @@ class LoggingManager final {
   const bool default_filter_user_data_;
   const int default_max_vlog_level_;
   bool owns_default_logger_;
+
   static Logger* s_default_logger_;
 
   struct Epochs {
@@ -245,6 +253,18 @@ class Logger {
         filter_user_data_{filter_user_data},
         max_vlog_level_{severity > Severity::kVERBOSE ? -1 : vlog_level} {  // disable unless logging VLOG messages
   }
+
+  /**
+     Get the minimum severity level for log messages to be output.
+     @returns The severity.
+  */
+  Severity GetSeverity() const noexcept { return min_severity_; }
+
+  /**
+     Change the minimum severity level for log messages to be output.
+     @param severity The severity.
+  */
+  void SetSeverity(Severity severity) noexcept { min_severity_ = severity; }
 
   /**
      Check if output is enabled for the provided LogSeverity and DataType values.
@@ -282,7 +302,7 @@ class Logger {
  private:
   const LoggingManager* logging_manager_;
   const std::string id_;
-  const Severity min_severity_;
+  Severity min_severity_;
   const bool filter_user_data_;
   const int max_vlog_level_;
 };
@@ -290,10 +310,19 @@ class Logger {
 inline const Logger& LoggingManager::DefaultLogger() {
   if (s_default_logger_ == nullptr) {
     // fail early for attempted misuse. don't use logging macros as we have no logger.
-    throw std::logic_error("Attempt to use DefaultLogger but none has been registered.");
+    ORT_THROW("Attempt to use DefaultLogger but none has been registered.");
   }
 
   return *s_default_logger_;
+}
+
+inline void LoggingManager::SetDefaultLoggerSeverity(Severity severity) {
+  if (s_default_logger_ == nullptr) {
+    // fail early for attempted misuse. don't use logging macros as we have no logger.
+    ORT_THROW("Attempt to use DefaultLogger but none has been registered.");
+  }
+
+  s_default_logger_->SetSeverity(severity);
 }
 
 inline Timestamp LoggingManager::GetTimestamp() const noexcept {

@@ -10,7 +10,7 @@ void TestShape(const std::initializer_list<T>& data, const std::vector<int64_t>&
   OpTester test("Shape");
   test.AddInput<T>("data", shape, data);
   test.AddOutput<int64_t>("output", {static_cast<int64_t>(shape.size())}, shape);
-  test.Run();
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kTensorrtExecutionProvider});//TensorRT parser: unsupported data types
 }
 
 TEST(ShapeOpTest, ShapeTestBool)   { TestShape <bool>     ({true, true, false, false, true, false}, {2,  3}); }
@@ -24,6 +24,6 @@ TEST(ShapeOpTest, ShapeTestUint8)  { TestShape <uint8_t>  ({1, 2, 3, 4, 5, 6, 7,
 TEST(ShapeOpTest, ShapeTestUint16) { TestShape <uint16_t> ({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {1, 12}); }
 TEST(ShapeOpTest, ShapeTestUint32) { TestShape <uint32_t> ({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {12, 1}); }
 TEST(ShapeOpTest, ShapeTestUint64) { TestShape <uint64_t> ({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {1, 12}); }
-
+TEST(ShapeOpTest, ShapeTestString) { TestShape<std::string>({"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}, {1, 12}); }
 }
 }

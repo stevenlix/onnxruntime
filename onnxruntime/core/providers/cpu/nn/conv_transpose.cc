@@ -16,269 +16,305 @@
 /* Modifications Copyright (c) Microsoft. */
 
 #include "core/providers/cpu/nn/conv_transpose.h"
+
+#include "core/mlas/inc/mlas.h"
+#include "core/common/safeint.h"
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
 
 namespace onnxruntime {
 
-ONNX_CPU_OPERATOR_KERNEL(
+ONNX_CPU_OPERATOR_VERSIONED_KERNEL(
     ConvTranspose,
-    1,
+    1, 10,
     KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     ConvTranspose<float>);
 
-inline void ComputeTransposePadAndOutputShape(
-    const int64_t in_size,
-    const int64_t stride,
-    const int64_t kernel,
-    const int64_t adj,
-    AutoPadType pad_type,
-    int64_t* pad_head,
-    int64_t* pad_tail,
-    int64_t* out_size) {
-  if (*out_size != -1) {
-    ORT_ENFORCE(*out_size >= 0);
-    // total padding size
-    int64_t paddings = std::max<int64_t>(0, (in_size - 1) * stride + kernel + adj - *out_size);
-    if (pad_type == AutoPadType::SAME_UPPER) {  // pad more on head when paddings are odd.
-      *pad_head = paddings - paddings / 2;
-      *pad_tail = paddings / 2;
-    } else {
-      // for pad_type is NOTSET, SAME_LOWER or VALID
-      // set pad_head as paddings/2, pad_tail as paddings-paddings/2.
-      // That said, we pad more on tail when paddings are odd.
-      *pad_head = paddings / 2;
-      *pad_tail = paddings - paddings / 2;
-    }
-    return;
-  } else {
-    if (pad_type != AutoPadType::NOTSET) {
-      switch (pad_type) {
-          // We handle cases of AutoPadType::VALID and AutoPadType::SAME_UPPER/LOWER,
-          // the same way
-        case AutoPadType::VALID:
-        case AutoPadType::SAME_UPPER:
-        case AutoPadType::SAME_LOWER:
-          *pad_head = 0;
-          *pad_tail = 0;
-          *out_size = (in_size - 1) * stride + kernel + adj;
-          break;
-        default:
-          throw NotImplementedException("pad type not supported");
-      }
-    } else {
-      *out_size =
-          (in_size - 1) * stride + kernel + adj - *pad_head - *pad_tail;
-    }
-  }
-}
+ONNX_CPU_OPERATOR_KERNEL(
+    ConvTranspose,
+    11,
+    KernelDefBuilder().TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+    ConvTranspose<float>);
 
-Status ConvTransposeBase::PrepareForCompute(OpKernelContext* context, bool has_bias, ConvTransposeBase::Prepare& p) const {
-  const Tensor* X = context->Input<Tensor>(0);
-  const Tensor* F = context->Input<Tensor>(1);
-  const Tensor* B = has_bias ? context->Input<Tensor>(2) : nullptr;
-  const TensorShape& input_shape = X->Shape();
-
-  // input validations
-  if (group_ <= 0) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "group count is <= 0",
-                           " group: ", group_);
-  }
-
-  if (input_shape.NumDimensions() != 4) {
-    // This condition is not true for two tests in ONNX tests series:
-    // test_convtranspose_1d_cpu, test_convtranspose_3d_cpu.
-    // TODO: the error message should tell which operator raises it.
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Input X must be 4-dimensional.",
-                           " X: ", X->Shape().ToString().c_str());
-  }
-
-  if (input_shape.NumDimensions() != F->Shape().NumDimensions()) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "X num_dims does not match W num_dims.",
-                           " X: ", X->Shape().ToString().c_str(),
-                           " W: ", F->Shape().ToString().c_str());
-  }
-
-  const int64_t num_input_channels = input_shape[1];
-
-  if (F->Shape()[0] != num_input_channels) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "filter number not equal to input channel number.",
-                           " filter_number: ", F->Shape()[0],
-                           " num_input_channels: ", num_input_channels);
-  }
-
-  const int64_t N = input_shape[0];
-  const int64_t H = input_shape[2];
-  const int64_t W = input_shape[3];
-  const int64_t num_output_channels_multiplier = F->Shape()[1];
-  const int64_t num_output_channels = num_output_channels_multiplier * group_;
-
-  // it looks like num_output_channels is really k*group_ similar to how in the conv case
-  // num_input_channels is k*group_. hence removing the check for num_output_channels here.
-
-  if (num_input_channels % group_ != 0) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Input channels is not divisible by group.",
-                           " num_input_channels: ", num_input_channels,
-                           " group: ", group_);
-  }
-
-  std::vector<int64_t> kernel_shape;
-  ORT_RETURN_IF_ERROR(ComputeKernelShape(F->Shape(), kernel_shape));
-
-  std::vector<int64_t> output_padding(output_padding_);
-  if (output_padding.empty()) {
-    output_padding.resize(kernel_shape.size(), 0);
-  }
-  std::vector<int64_t> pads(pads_);
-  if (pads.empty()) {
-    pads.resize(kernel_shape.size() * 2, 0);
-  }
-  std::vector<int64_t> dilations(dilations_);
-  if (dilations.empty()) {
-    dilations.resize(kernel_shape.size(), 1);
-  }
-  std::vector<int64_t> strides(strides_);
-  if (strides.empty()) {
-    strides.resize(kernel_shape.size(), 1);
-  }
-
-  std::vector<int64_t> Y_dims;
-
-  ComputePadsAndOutputShape(input_shape, num_output_channels, kernel_shape, strides, output_padding, &pads, &Y_dims);
-  TensorShape Yshape(Y_dims);
-  Tensor* Y = context->Output(0, Yshape);
-
-  p.X = X;
-  p.F = F;
-  p.B = B;
-  p.Y = Y;
-  p.N = N;
-  p.H = H;
-  p.W = W;
-  p.num_input_channels = num_input_channels;
-  p.num_output_channels = num_output_channels;
-  p.kernel_shape = std::move(kernel_shape);
-  p.pads = std::move(pads);
-  p.strides = std::move(strides);
-  p.dilations = std::move(dilations);
+template <typename T>
+Status ConvTranspose<T>::PrePack(const Tensor& /*tensor*/, int /*input_idx*/, AllocatorPtr /*alloc*/,
+                                 /*out*/ bool& is_packed,
+                                 /*out*/ PrePackedWeights* /*prepacked_weights*/
+) {
+  is_packed = false;
   return Status::OK();
 }
 
-void ConvTransposeBase::ComputePadsAndOutputShape(
-    const TensorShape input_shape,
-    const int64_t output_channel,
-    const std::vector<int64_t>& kernel_shape,
-    const std::vector<int64_t>& strides,
-    const std::vector<int64_t>& output_padding,
-    std::vector<int64_t>* pads,
-    std::vector<int64_t>* output_shape) const {
-  const int64_t N = input_shape[0];
-  const int64_t H = input_shape[2];
-  const int64_t W = input_shape[3];
-  int64_t output_height = -1, output_width = -1;
-  size_t output_shape_size = output_shape_.size();
+template <>
+Status ConvTranspose<float>::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                                     /*out*/ bool& is_packed,
+                                     /*out*/ PrePackedWeights* prepacked_weights) {
+  is_packed = false;
 
-  if (output_shape_size != 0) {
-    output_height = output_shape_[output_shape_size - 2];
-    output_width = output_shape_[output_shape_size - 1];
-    ORT_ENFORCE(output_height >= H, "Output height cannot be smaller than input height.");
-    ORT_ENFORCE(output_width >= W, "Output width cannot be smaller than input width.");
+  // only pack filter tensor
+  if (input_idx == 1) {
+    if (tensor.Shape().NumDimensions() <= 2) {
+      return Status::OK();
+    }
+    filter_shape_ = tensor.Shape();
+
+    const size_t K = static_cast<size_t>(filter_shape_[0]) / conv_transpose_attrs_.group;
+    const size_t N = filter_shape_.SizeFromDimension(1);
+    auto packed_elements_per_group = N * K;
+    if (packed_elements_per_group == 0 || N == 1 || K == 1) {  // No need for single row or single col case
+      return Status::OK();
+    }
+
+    size_t packed_filter_data_size = packed_elements_per_group * sizeof(float) * conv_transpose_attrs_.group;
+    auto* packed_filter_data = alloc->Alloc(packed_filter_data_size);
+
+    // Initialize memory to 0 as there could be some padding associated with pre-packed
+    // buffer memory and we don not want it uninitialized and generate different hashes
+    // if and when we try to cache this pre-packed buffer for sharing between sessions.
+    memset(packed_filter_data, 0, packed_filter_data_size);
+
+    transposed_filter_ = BufferUniquePtr(packed_filter_data, BufferDeleter(alloc));
+
+    for (int64_t group_id = 0; group_id < conv_transpose_attrs_.group; ++group_id) {
+      MlasTranspose(tensor.Data<float>() + (N * K * group_id),
+                    ((float*)packed_filter_data) + (group_id * packed_elements_per_group),
+                    K, N);
+    }
+
+    bool share_prepacked_weights = (prepacked_weights != nullptr);
+    if (share_prepacked_weights) {
+      prepacked_weights->buffers_.push_back(std::move(transposed_filter_));
+      prepacked_weights->buffer_sizes_.push_back(packed_filter_data_size);
+    }
+
+    is_packed = true;
+  }
+  return Status::OK();
+}
+
+template <typename T>
+Status ConvTranspose<T>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& /*prepacked_buffers*/,
+                                                   int /*input_idx*/,
+                                                   /*out*/ bool& used_shared_buffers) {
+  used_shared_buffers = false;
+  return Status::OK();
+}
+
+template <>
+Status ConvTranspose<float>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                                       int input_idx,
+                                                       /*out*/ bool& used_shared_buffers) {
+  used_shared_buffers = false;
+
+  if (input_idx == 1) {
+    used_shared_buffers = true;
+    transposed_filter_ = std::move(prepacked_buffers[0]);
   }
 
-  ComputeTransposePadAndOutputShape(
-      H,
-      strides[0],
-      kernel_shape[0],
-      output_padding[0],
-      auto_pad_,
-      &pads->at(0),
-      &pads->at(2),
-      &output_height);
-
-  ComputeTransposePadAndOutputShape(
-      W,
-      strides[1],
-      kernel_shape[1],
-      output_padding[1],
-      auto_pad_,
-      &pads->at(1),
-      &pads->at(3),
-      &output_width);
-
-  output_shape->insert(output_shape->begin(), {N, output_channel, output_height, output_width});
+  return Status::OK();
 }
 
 template <typename T>
 Status ConvTranspose<T>::Compute(OpKernelContext* context) const {
-  size_t num_inputs = OpKernel::Node().InputDefs().size();
-  Prepare p;
-  ORT_RETURN_IF_ERROR(PrepareForCompute(context, num_inputs == 3, p));
+  return ConvTranspose<T>::DoConvTranspose(context, false);
+}
 
-  const int64_t input_image_size = p.H * p.W;
-  const int64_t X_offset = p.num_input_channels / group_ * input_image_size;
-  const int64_t Y_offset = p.Y->Shape().Size() / p.Y->Shape()[0] / group_;
-  const int64_t W_offset = p.F->Shape().Size() / group_;
-  const int64_t kernel_dim = p.num_output_channels / group_ * p.kernel_shape[0] * p.kernel_shape[1];
-  const int64_t output_image_size = p.Y->Shape()[2] * p.Y->Shape()[3];
+template <typename T>
+Status ConvTranspose<T>::DoConvTranspose(OpKernelContext* context, bool dynamic_padding) const {
+  concurrency::ThreadPool* thread_pool = context->GetOperatorThreadPool();
+
+  size_t num_inputs = OpKernel::Node().InputDefs().size();
+  ConvTransposeAttributes::Prepare p;
+  bool has_bias = dynamic_padding ? num_inputs == 4 : num_inputs == 3;
+  ORT_RETURN_IF_ERROR(conv_transpose_attrs_.PrepareForCompute(context, has_bias, p, dynamic_padding));
+
+  // Bail out early if one of the dimensions is zero.
+  if (p.Y->Shape().Size() == 0) {
+    return Status::OK();
+  }
+
+  const int64_t input_image_size = p.input_shape.Size();
+  const int64_t X_offset = p.num_input_channels / conv_transpose_attrs_.group * input_image_size;
+  const int64_t Y_offset = p.Y->Shape().Size() / p.Y->Shape()[0] / conv_transpose_attrs_.group;
+  const int64_t W_offset = p.F->Shape().Size() / conv_transpose_attrs_.group;
+  const int64_t kernel_size = TensorShape(p.kernel_shape).Size();
+  const int64_t kernel_dim = p.num_output_channels / conv_transpose_attrs_.group * kernel_size;
+  const int64_t output_size = (p.Y->Shape().Slice(2)).Size();
 
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
 
-  auto col_data = alloc->Alloc(sizeof(T) * kernel_dim * p.H * p.W);
+  const int64_t col_buffer_size = kernel_dim * p.input_shape.Size();
+  auto col_data = alloc->Alloc(SafeInt<size_t>(sizeof(T)) * col_buffer_size);
   BufferUniquePtr col_buffer(col_data, BufferDeleter(alloc));
   T* col_buffer_data = static_cast<T*>(col_buffer.get());
 
   const T* Xdata = p.X->template Data<T>();
   const T* filter_data = p.F->template Data<T>();
   T* Ydata = p.Y->template MutableData<T>();
+  TensorShape output_shape = p.Y->Shape().Slice(2);
 
   for (auto image_id = 0; image_id < p.N; ++image_id) {
-    for (int group_id = 0; group_id < group_; ++group_id) {
+    for (int group_id = 0; group_id < conv_transpose_attrs_.group; ++group_id) {
       // Weight term
-      math::Gemm<T, CPUMathUtil>(
+      math::Gemm<T>(
           CblasTrans,
           CblasNoTrans,
           kernel_dim,
           input_image_size,
-          p.num_input_channels / group_,
+          p.num_input_channels / conv_transpose_attrs_.group,
           1,
           filter_data + group_id * W_offset,
           Xdata + group_id * X_offset,
           0,
           col_buffer_data,
-          &CPUMathUtil::Instance());
+          thread_pool);
 
-      // Col2im
-      math::Col2im<T, CPUMathUtil, StorageOrder::NCHW>(
-          col_buffer_data,
-          p.num_output_channels / group_,
-          p.Y->Shape()[2],
-          p.Y->Shape()[3],
-          p.kernel_shape[0],
-          p.kernel_shape[1],
-          1,
-          1,
-          p.pads[0],
-          p.pads[1],
-          p.pads[2],
-          p.pads[3],
-          p.strides[0],
-          p.strides[1],
-          Ydata + group_id * Y_offset,
-          &CPUMathUtil::Instance());
+      if (p.X->Shape().NumDimensions() == 4) {
+        math::Col2im<T, CPUMathUtil, StorageOrder::NCHW>(
+            col_buffer_data,
+            p.num_output_channels / conv_transpose_attrs_.group,
+            p.Y->Shape()[2],
+            p.Y->Shape()[3],
+            p.kernel_shape[0],
+            p.kernel_shape[1],
+            p.dilations[0],
+            p.dilations[1],
+            p.pads[0],
+            p.pads[1],
+            p.pads[2],
+            p.pads[3],
+            p.strides[0],
+            p.strides[1],
+            Ydata + group_id * Y_offset,
+            &CPUMathUtil::Instance());
+      } else {
+        math::Col2imNd<T, CPUMathUtil, StorageOrder::NCHW>(
+            col_buffer_data,
+            output_shape.GetDims().data(),
+            p.input_shape.GetDims().data(),
+            kernel_dim,
+            Y_offset,
+            p.kernel_shape.data(),
+            p.strides.data(),
+            p.dilations.data(),
+            p.pads.data(),
+            static_cast<int>(p.kernel_shape.size()),
+            Ydata + group_id * Y_offset,
+            &CPUMathUtil::Instance());
+      }
     }
 
     if (p.B != nullptr) {
-      auto Ymatrix = EigenMatrixMap<T>(Ydata, output_image_size, p.num_output_channels);
+      auto Ymatrix = EigenMatrixMap<T>(Ydata, output_size, p.num_output_channels);
       auto Bvec = ConstEigenVectorMap<T>(p.B->template Data<T>(), p.num_output_channels);
       Ymatrix.rowwise() += Bvec.transpose();
     }
 
-    Xdata += X_offset * group_;
-    Ydata += Y_offset * group_;
+    Xdata += X_offset * conv_transpose_attrs_.group;
+    Ydata += Y_offset * conv_transpose_attrs_.group;
   }
 
   return Status::OK();
 }
 
+template <>
+Status ConvTranspose<float>::DoConvTranspose(OpKernelContext* context, bool dynamic_padding) const {
+  concurrency::ThreadPool* thread_pool = context->GetOperatorThreadPool();
+
+  size_t num_inputs = OpKernel::Node().InputDefs().size();
+  ConvTransposeAttributes::Prepare p;
+  bool has_bias = dynamic_padding ? num_inputs == 4 : num_inputs == 3;
+  ORT_RETURN_IF_ERROR(conv_transpose_attrs_.PrepareForCompute(
+      context, has_bias, p, dynamic_padding, transposed_filter_ ? &filter_shape_ : nullptr));
+
+  // Bail out early if one of the dimensions is zero.
+  if (p.Y->Shape().Size() == 0) {
+    return Status::OK();
+  }
+
+  const int64_t input_image_size = p.input_shape.Size();
+  const int64_t X_offset = p.num_input_channels / conv_transpose_attrs_.group * input_image_size;
+  const int64_t Y_offset = p.Y->Shape().Size() / p.Y->Shape()[0] / conv_transpose_attrs_.group;
+  const int64_t W_offset = (p.F ? p.F->Shape().Size() : filter_shape_.Size()) / conv_transpose_attrs_.group;
+  const int64_t kernel_size = TensorShape(p.kernel_shape).Size();
+  const int64_t kernel_dim = p.num_output_channels / conv_transpose_attrs_.group * kernel_size;
+  const int64_t output_size = (p.Y->Shape().Slice(2)).Size();
+
+  AllocatorPtr alloc;
+  ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
+
+  const int64_t col_buffer_size = kernel_dim * p.input_shape.Size();
+  auto col_data = alloc->Alloc(SafeInt<size_t>(sizeof(float)) * col_buffer_size);
+  BufferUniquePtr col_buffer(col_data, BufferDeleter(alloc));
+  float* col_buffer_data = static_cast<float*>(col_buffer.get());
+
+  const float* Xdata = p.X->template Data<float>();
+  const float* filter_data = p.F ? p.F->template Data<float>() : static_cast<float*>(transposed_filter_.get());
+  float* Ydata = p.Y->template MutableData<float>();
+  TensorShape output_shape = p.Y->Shape().Slice(2);
+
+  for (auto image_id = 0; image_id < p.N; ++image_id) {
+    for (int group_id = 0; group_id < conv_transpose_attrs_.group; ++group_id) {
+      // Weight term
+      math::Gemm<float>(
+          p.F ? CblasTrans : CblasNoTrans,
+          CblasNoTrans,
+          kernel_dim,
+          input_image_size,
+          p.num_input_channels / conv_transpose_attrs_.group,
+          1,
+          filter_data + group_id * W_offset,
+          Xdata + group_id * X_offset,
+          0,
+          col_buffer_data,
+          thread_pool);
+
+      if (p.X->Shape().NumDimensions() == 4) {
+        math::Col2im<float, CPUMathUtil, StorageOrder::NCHW>(
+            col_buffer_data,
+            p.num_output_channels / conv_transpose_attrs_.group,
+            p.Y->Shape()[2],
+            p.Y->Shape()[3],
+            p.kernel_shape[0],
+            p.kernel_shape[1],
+            p.dilations[0],
+            p.dilations[1],
+            p.pads[0],
+            p.pads[1],
+            p.pads[2],
+            p.pads[3],
+            p.strides[0],
+            p.strides[1],
+            Ydata + group_id * Y_offset,
+            &CPUMathUtil::Instance());
+      } else {
+        math::Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(
+            col_buffer_data,
+            output_shape.GetDims().data(),
+            p.input_shape.GetDims().data(),
+            kernel_dim,
+            Y_offset,
+            p.kernel_shape.data(),
+            p.strides.data(),
+            p.dilations.data(),
+            p.pads.data(),
+            static_cast<int>(p.kernel_shape.size()),
+            Ydata + group_id * Y_offset,
+            &CPUMathUtil::Instance());
+      }
+    }
+
+    if (p.B != nullptr) {
+      auto Ymatrix = EigenMatrixMap<float>(Ydata, output_size, p.num_output_channels);
+      auto Bvec = ConstEigenVectorMap<float>(p.B->template Data<float>(), p.num_output_channels);
+      Ymatrix.rowwise() += Bvec.transpose();
+    }
+
+    Xdata += X_offset * conv_transpose_attrs_.group;
+    Ydata += Y_offset * conv_transpose_attrs_.group;
+  }
+
+  return Status::OK();
+}
 }  // namespace onnxruntime

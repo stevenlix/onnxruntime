@@ -24,9 +24,11 @@ struct RunOptions {
   bool scalar_loop_state_value = false;
   bool add_bad_shape = false;
   bool mixed_execution_providers = false;
+  // Disable TensorRT because its parser fails, and it can't handle unknown dimensions
+  std::unordered_set<std::string> excluded_provider_types{kTensorrtExecutionProvider};
 };
 
-static void CreateSubgraph(Graph& graph, RunOptions& options, const std::string& failure_message = "");
+static common::Status CreateSubgraph(Graph& graph, RunOptions& options, const std::string& failure_message = "");
 
 static const float kOuterNodeAddValue = 42.f;
 
@@ -56,7 +58,7 @@ class ScanOpTester : public OpTester {
         TensorProto value_tensor;
         value_tensor.add_dims(1);
         value_tensor.add_float_data(kOuterNodeAddValue);
-        value_tensor.set_data_type(onnx::TensorProto_DataType_FLOAT);
+        value_tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
 
         constant.AddAttribute("value", value_tensor);
 
@@ -71,14 +73,14 @@ class ScanOpTester : public OpTester {
   }
 };
 
-static void CreateSubgraph(Graph& graph, RunOptions& options, const std::string& failure_message) {
+static common::Status CreateSubgraph(Graph& graph, RunOptions& options, const std::string& failure_message) {
   bool include_dim_values = options.include_dim_values_in_subgraph;
   bool include_types = options.include_types_in_subgraph;
 
   std::vector<NodeArg*> inputs;
   std::vector<NodeArg*> outputs;
 
-  /* Subgraph looks like this. 
+  /* Subgraph looks like this.
 
     [constant_1]  loop_state_in_1             concat_in_0      concat_in_1
             \           |                                 \     /
@@ -122,7 +124,7 @@ static void CreateSubgraph(Graph& graph, RunOptions& options, const std::string&
       if (!options.scalar_loop_state_value)
         value_tensor.add_dims(1);
       value_tensor.add_float_data(1.f);
-      value_tensor.set_data_type(onnx::TensorProto_DataType_FLOAT);
+      value_tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
 
       constant.AddAttribute("value", value_tensor);
     }
@@ -251,6 +253,8 @@ static void CreateSubgraph(Graph& graph, RunOptions& options, const std::string&
     EXPECT_TRUE(!status.IsOK());
     EXPECT_THAT(status.ErrorMessage(), testing::HasSubstr(failure_message));
   }
+
+  return status;
 }
 
 static void RunTest_v8(const std::string test_name, int64_t batch_size, int64_t max_sequence_len, int64_t input_size,
@@ -268,9 +272,11 @@ static void RunTest_v8(const std::string test_name, int64_t batch_size, int64_t 
                        OpTester::ExpectResult expect_result = OpTester::ExpectResult::kExpectSuccess,
                        const std::string& failure_message = "") {
   // create model that will be used to initialize subgraph. currently there's no direct way to create a Graph instance.
-  Model model(test_name);
+  Model model(test_name, false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(), {{"", 8}},
+              {}, DefaultLoggingManager().DefaultLogger());
   auto& graph = model.MainGraph();
-  CreateSubgraph(graph, options, options.add_bad_shape ? failure_message : "");
+  auto status = CreateSubgraph(graph, options, options.add_bad_shape ? failure_message : "");
+  ASSERT_STATUS_OK(status);
   auto& proto = graph.ToGraphProto();
 
   ScanOpTester test{8};
@@ -283,7 +289,7 @@ static void RunTest_v8(const std::string test_name, int64_t batch_size, int64_t 
   }
 
   if (sequence_lens == nullptr) {
-    test.AddMissingOptionalInput<int64_t>();
+    test.AddOptionalInputEdge<int64_t>();
   } else {
     std::vector<int64_t> sequence_lens_dims{batch_size};
     test.AddInput<int64_t>("sequence_lens", sequence_lens_dims, *sequence_lens);
@@ -310,7 +316,7 @@ static void RunTest_v8(const std::string test_name, int64_t batch_size, int64_t 
   test.AddOutput<float>("scan_output_2", output_shape, output_2);
   test.AddOutput<float>("scan_output_3", output_shape, output_3);
 
-  test.Run(expect_result, failure_message);
+  test.Run(expect_result, failure_message, options.excluded_provider_types);
 }
 
 static void RunTest_v9(const std::string test_name, int64_t sequence_len, int64_t input_size,
@@ -330,12 +336,16 @@ static void RunTest_v9(const std::string test_name, int64_t sequence_len, int64_
                        OpTester::ExpectResult expect_result = OpTester::ExpectResult::kExpectSuccess,
                        const std::string& failure_message = "") {
   // create model that will be used to initialize subgraph. currently there's no direct way to create a Graph instance.
-  Model model(test_name);
+  Model model(test_name, false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(), {{"", 11}},
+              {}, DefaultLoggingManager().DefaultLogger());
   auto& graph = model.MainGraph();
-  CreateSubgraph(graph, options, options.add_bad_shape ? failure_message : "");
+  auto status = CreateSubgraph(graph, options, options.add_bad_shape ? failure_message : "");
+  if (!status.IsOK()) {
+    return;
+  }
   auto& proto = graph.ToGraphProto();
 
-  ScanOpTester test{9};
+  ScanOpTester test{(options.add_bad_shape) ? -1 : 11};  // use latest version - no significant change over 9
 
   test.AddAttribute("body", proto);
   test.AddAttribute<int64_t>("num_scan_inputs", 2);
@@ -380,10 +390,10 @@ static void RunTest_v9(const std::string test_name, int64_t sequence_len, int64_
 
       // skip if this is an invalid input test and axis is out of the valid range
       if (axis >= -rank && axis < rank) {
-        std::vector<int64_t> permutations;
+        std::vector<size_t> permutations;
         std::vector<int64_t> new_shape;
-        scan::detail::CalculateTransposedShape(output_shape, HandleNegativeAxis(axis, output_shape.size()),
-                                               permutations, new_shape);
+        scan::detail::CalculateTransposedShapeForOutput(output_shape, HandleNegativeAxis(axis, output_shape.size()),
+                                                        permutations, new_shape);
         return new_shape;
       }
     }
@@ -397,15 +407,15 @@ static void RunTest_v9(const std::string test_name, int64_t sequence_len, int64_
   test.AddOutput<float>("scan_output_3", calculate_output_shape(3), output_3);
 
   if (options.mixed_execution_providers) {
-    // we want the CUDA provider to be first, and the CPU provider second. all except the Scannode should run on
+    // we want the CUDA provider to be first, and the CPU provider second. all except the Scan node should run on
     // CUDA given that, which creates the scenario where we need to copy to/from CPU to execute the Scan node correctly.
     std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
     execution_providers.push_back(DefaultCudaExecutionProvider());
     execution_providers.push_back(DefaultCpuExecutionProvider());
 
-    test.Run(expect_result, failure_message, {}, nullptr, &execution_providers);
+    test.Run(expect_result, failure_message, options.excluded_provider_types, nullptr, &execution_providers);
   } else {
-    test.Run(expect_result, failure_message);
+    test.Run(expect_result, failure_message, options.excluded_provider_types);
   }
 }
 
@@ -553,9 +563,12 @@ static void OuterScopeAccess_NoShapeInMainGraph_NoTypeAndShapeInSubgraph(bool is
 
 TEST_8_AND_9(OuterScopeAccess_NoShapeInMainGraph_NoTypeAndShapeInSubgraph);
 
-static void BadShape(bool is_v8) {
+// shape inferencing is only strict for the latest version so only test BadShape with that
+// Scan test uses Split operator in the subgraph. It was updated for opset13
+// Enable this test once Split for op13 is implemented.
+TEST(Scan9, DISABLED_BadShape) {
   RunOptions options{};
-  options.is_v8 = is_v8;
+  options.is_v8 = false;
   options.include_dim_values_in_main_graph = false;
   options.include_types_in_subgraph = true;
   options.include_dim_values_in_subgraph = true;
@@ -566,8 +579,6 @@ static void BadShape(bool is_v8) {
       "Node:concat Output:concat_out_1 [ShapeInferenceError] Mismatch between number of source and target dimensions. "
       "Source=2 Target=1");
 }
-
-TEST_8_AND_9(BadShape);
 
 TEST(Scan8, ShortSequenceTwoInBatchOneLoopStateVar) {
   const int64_t batch_size = 2;
@@ -604,39 +615,45 @@ TEST(Scan8, ShortSequenceTwoInBatchOneLoopStateVar) {
 }
 
 TEST(Scan8, MixedSequenceLens) {
-  const int64_t batch_size = 2;
+  const int64_t batch_size = 3;
   const int64_t max_sequence_len = 2;
   const int64_t input_size = 2;
 
-  std::vector<int64_t> sequence_lens{1, 2};
+  std::vector<int64_t> sequence_lens{1, 2, 2};
 
-  std::vector<float> iteration_count_in{0.f, 10.f};  // start at 0 for first item in batch, and 10 for second
+  std::vector<float> iteration_count_in{0.f, 10.f, 1.f};  // start at 0 for first item in batch, and 10 for second
 
   // batch_size, max_sequence_len, input_size
   std::vector<float> input_0{1.f, 2.f,
                              4.f, 3.f,  // <- this should be ignored
 
                              -1.f, -2.f,
-                             -4.f, -3.f};
+                             -4.f, -3.f,
+
+                             10.f, 11.f,
+                             12.f, 13.f};
 
   std::vector<float> input_1{3.f, 4.f,
                              2.f, 1.f,  // <- this should be ignored
 
                              -3.f, -4.f,
-                             -2.f, -1.f};
+                             -2.f, -1.f,
+
+                             22.f, 33.f,
+                             44.f, 55.f};
 
   // iteration_count_in + 1 for each item in sequence.
   // as sequence_len is 1 for the first item in the batch, the final value should be 0 + 1.
   // as sequence_len is 2 for the second item in the batch, the final value should be 10 + 1 + 1.
-  std::vector<float> iteration_count_out{1.f, 12.f};
+  std::vector<float> iteration_count_out{1.f, 12.f, 3.f};
 
   // batch_size, max_sequence_len, 1
   // as sequence_len is 1 for the first item in the batch we expect 0.f's for the second value in the output
   // (which technically is undefined, but 0.f is consistent with other RNN ops)
-  std::vector<float> output_0{1.f, 0.f, -1.f, -4.f};
-  std::vector<float> output_1{2.f, 0.f, -2.f, -3.f};
-  std::vector<float> output_2{3.f, 0.f, -3.f, -2.f};
-  std::vector<float> output_3{4.f, 0.f, -4.f, -1.f};
+  std::vector<float> output_0{1.f, 0.f, -1.f, -4.f, 10.f, 12.f};
+  std::vector<float> output_1{2.f, 0.f, -2.f, -3.f, 11.f, 13.f};
+  std::vector<float> output_2{3.f, 0.f, -3.f, -2.f, 22.f, 44.f};
+  std::vector<float> output_3{4.f, 0.f, -4.f, -1.f, 33.f, 55.f};
 
   RunTest_v8("MixedSequenceLens", batch_size, max_sequence_len, input_size,
              nullptr, &sequence_lens,
@@ -844,6 +861,48 @@ TEST(Scan9, TransposeOutput) {
              iteration_count_out, output_0, output_1, output_2, output_3);
 }
 
+TEST(Scan9, TransposeOutputDim2) {
+  // Construct scan body subgraph with 1 scan inputs, 1 scan outputs
+  // scan-in-1 => scan-out-1
+  Model model("ScanBody", false, DefaultLoggingManager().DefaultLogger());
+  auto& graph = model.MainGraph();
+
+  TypeProto float_tensor;
+  float_tensor.mutable_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+  float_tensor.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
+  float_tensor.mutable_tensor_type()->mutable_shape()->add_dim()->set_dim_value(1);
+
+  auto& scan_in_1 = graph.GetOrCreateNodeArg("scan_in_1", &float_tensor);
+  auto& scan_out_1 = graph.GetOrCreateNodeArg("scan_out_1", &float_tensor);
+
+  graph.AddNode("pass_through", "Identity", "Copy scan_in_1 to scan_out_1", {&scan_in_1}, {&scan_out_1});
+
+  auto status = graph.Resolve();
+  EXPECT_EQ(status, Status::OK());
+
+  auto& scan_body = graph.ToGraphProto();
+
+  ScanOpTester test{9};
+
+  std::vector<int64_t> input_shape{2, 1, 1};
+
+  // transpose on axis 2, so dim 0 of the output (copied directly from input of {2, 1, 1})
+  // will move to dim 2 of the output giving shape {1, 1, 2}
+  std::vector<int64_t> output_axes{2};
+  std::vector<int64_t> output_shape{1, 1, 2};
+
+  test.AddAttribute("body", scan_body);
+  test.AddAttribute<int64_t>("num_scan_inputs", 1);
+  test.AddAttribute<std::vector<int64_t>>("scan_output_axes", output_axes);
+
+  // the data won't change, but the shape should be transposed from 2, 1, 1 to 1, 1, 2, which
+  // OpTester::Run will validate
+  test.AddInput<float>("scan_input_1", input_shape, {1.0, 2.0});
+  test.AddOutput<float>("scan_output_1", output_shape, {1.0, 2.0});
+
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", RunOptions().excluded_provider_types);
+}
+
 static void InvalidInput(bool is_v8) {
   const int64_t batch_size = 1;
   const int64_t sequence_len = 2;
@@ -973,7 +1032,7 @@ void MixedTypeInputs(bool is_v8) {
   // state-in-2 => scan-out-2
   // scan-in-2 => state-out-2
 
-  Model model("ScanBody");
+  Model model("ScanBody", false, DefaultLoggingManager().DefaultLogger());
   auto& graph = model.MainGraph();
 
   TypeProto float_tensor;
@@ -998,8 +1057,8 @@ void MixedTypeInputs(bool is_v8) {
   graph.AddNode("node3", "Identity", "Copy scan_in_1 to state_out_1", {&scan_in_1}, {&state_out_1});
   graph.AddNode("node4", "Identity", "Copy scan_in_2 to state_out_2", {&scan_in_2}, {&state_out_2});
 
-  graph.SetInputOrder({&state_in_1, &state_in_2, &scan_in_1, &scan_in_2});
-  graph.SetOutputOrder({&state_out_1, &state_out_2, &scan_out_1, &scan_out_2});
+  graph.SetInputs({&state_in_1, &state_in_2, &scan_in_1, &scan_in_2});
+  graph.SetOutputs({&state_out_1, &state_out_2, &scan_out_1, &scan_out_2});
 
   auto status = graph.Resolve();
   EXPECT_EQ(status, Status::OK());
@@ -1017,7 +1076,7 @@ void MixedTypeInputs(bool is_v8) {
     seq_shape.insert(seq_shape.begin(), batch_size);
     state_shape.insert(state_shape.begin(), batch_size);
 
-    test.AddMissingOptionalInput<int64_t>();
+    test.AddOptionalInputEdge<int64_t>();
   }
 
   test.AddAttribute("body", scan_body);
@@ -1033,15 +1092,15 @@ void MixedTypeInputs(bool is_v8) {
   test.AddOutput<float>("scan_output_1", seq_shape, {0.0, 1.0, 2.0});
   test.AddOutput<int64_t>("scan_output_2", seq_shape, {0, 1, 2});
 
-  test.Run();
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", RunOptions().excluded_provider_types);
 }
 
 TEST_8_AND_9(MixedTypeInputs);
 
 // create a subgraph that will have unknown dimensions in both the loop state variable and output
 // after shape inferencing.
-void UnknownDimInSubgraphOutput(bool is_v8) {
-  Model model("ScanBody");
+void UnknownDimInSubgraphOutput(bool is_v8, bool mixed_execution_providers = false) {
+  Model model("ScanBody", false, DefaultLoggingManager().DefaultLogger());
   auto& graph = model.MainGraph();
 
   TypeProto float_tensor;
@@ -1060,8 +1119,8 @@ void UnknownDimInSubgraphOutput(bool is_v8) {
   graph.AddNode("node1", "Identity", "Copy state_in_1 to scan_out_1", {&state_in_1}, {&scan_out_1});
   graph.AddNode("node2", "Identity", "Copy scan_in_1 to state_out_1", {&scan_in_1}, {&state_out_1});
 
-  graph.SetInputOrder({&state_in_1, &scan_in_1});
-  graph.SetOutputOrder({&state_out_1, &scan_out_1});
+  graph.SetInputs({&state_in_1, &scan_in_1});
+  graph.SetOutputs({&state_out_1, &scan_out_1});
 
   auto status = graph.Resolve();
   EXPECT_EQ(status, Status::OK());
@@ -1079,7 +1138,7 @@ void UnknownDimInSubgraphOutput(bool is_v8) {
     seq_shape.insert(seq_shape.begin(), batch_size);
     state_shape.insert(state_shape.begin(), batch_size);
 
-    test.AddMissingOptionalInput<int64_t>();
+    test.AddOptionalInputEdge<int64_t>();
   }
 
   test.AddAttribute("body", scan_body);
@@ -1098,7 +1157,18 @@ void UnknownDimInSubgraphOutput(bool is_v8) {
   test.AddOutput<float>("final_state_1", state_shape, {3.0});
   test.AddOutput<float>("scan_output_1", seq_shape, {0.0, 1.0, 2.0});
 
-  test.Run();
+  if (mixed_execution_providers) {
+    // we want the CUDA provider to be first, and the CPU provider second. all except the Scan node should run on
+    // CUDA given that, which creates the scenario where we need to copy to/from CPU to execute the Scan node correctly.
+    std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+    execution_providers.push_back(DefaultCudaExecutionProvider());
+    execution_providers.push_back(DefaultCpuExecutionProvider());
+
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", RunOptions().excluded_provider_types, nullptr,
+             &execution_providers);
+  } else {
+    test.Run(OpTester::ExpectResult::kExpectSuccess, "", RunOptions().excluded_provider_types);
+  }
 }
 
 TEST_8_AND_9(UnknownDimInSubgraphOutput);
@@ -1111,6 +1181,12 @@ TEST(Scan, MixedExecutionProviders) {
 
   ShortSequenceOneInBatchOneLoopStateVar(options);
 }
+
+TEST(Scan, MixedExecutionProvidersUnknownDimInSubgraphOutput) {
+  UnknownDimInSubgraphOutput(/*is_v8*/ true, /*mixed_execution_providers*/ true);
+  UnknownDimInSubgraphOutput(/*is_v8*/ false, /*mixed_execution_providers*/ true);
+}
+
 #endif
 
 }  // namespace test

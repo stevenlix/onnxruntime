@@ -2,23 +2,19 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include <mutex>
+#include <deque>
+#include <map>
+#include <sstream>
+
+#include "onnx/onnx_pb.h"
+#include "onnx/onnx-operators_pb.h"
+#include "onnx/defs/schema.h"
+
 #include "core/graph/constants.h"
 #include "core/common/common.h"
 #include "core/common/status.h"
 #include "core/platform/ort_mutex.h"
-
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wignored-qualifiers"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#endif
-#include "onnx/defs/schema.h"
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
-#include <mutex>
-#include <deque>
-#include "sstream"
 
 namespace onnxruntime {
 using OpName_Domain_Version_Schema_Map = std::unordered_map<
@@ -44,10 +40,8 @@ class IOnnxRuntimeOpSchemaCollection : public ONNX_NAMESPACE::ISchemaRegistry {
 
   using ISchemaRegistry::GetSchema;
 
-  virtual const ONNX_NAMESPACE::OpSchema* GetSchema(
-      const std::string& key,
-      const int maxInclusiveVersion,
-      const std::string& domain) const final {
+  const ONNX_NAMESPACE::OpSchema* GetSchema(const std::string& key, const int maxInclusiveVersion,
+                                            const std::string& domain) const final {
     const ONNX_NAMESPACE::OpSchema* latest_schema = nullptr;
     int earliest_opset_where_unchanged = std::numeric_limits<int>::max();
     GetSchemaAndHistory(key, maxInclusiveVersion, domain, &latest_schema, &earliest_opset_where_unchanged);
@@ -97,12 +91,9 @@ class OnnxRuntimeOpSchemaRegistry : public IOnnxRuntimeOpSchemaCollection {
 
   using IOnnxRuntimeOpSchemaCollection::GetSchema;
 
-  void GetSchemaAndHistory(
-      const std::string& key,
-      const int maxInclusiveVersion,
-      const std::string& domain,
-      const ONNX_NAMESPACE::OpSchema** latest_schema,
-      int* earliest_opset_where_unchanged) const override;
+  void GetSchemaAndHistory(const std::string& key, int maxInclusiveVersion, const std::string& domain,
+                           const ONNX_NAMESPACE::OpSchema** latest_schema,
+                           int* earliest_opset_where_unchanged) const override;
 
   bool empty() const {
     return map_.empty();
@@ -143,6 +134,10 @@ class SchemaRegistryManager : public onnxruntime::IOnnxRuntimeOpSchemaCollection
   */
   DomainToVersionMap GetLatestOpsetVersions(bool is_onnx_only) const override;
 
+  /** Gets the last released opset versions.
+  @param is_onnx_only If true, return ONNX schemas only. If false, return the schemas for all domains.
+  */
+  DomainToVersionMap GetLastReleasedOpsetVersions(bool is_onnx_only) const ;
   /**
   Gets the OpSchema and its history.
   Searches custom schema registries starting with the last one added. \
@@ -155,14 +150,13 @@ class SchemaRegistryManager : public onnxruntime::IOnnxRuntimeOpSchemaCollection
   @param[out] earliest_opset_where_unchanged The earliest opset version preceding max_inclusive_version where the
   operator is known to be unchanged.
   */
-  void GetSchemaAndHistory(
-      const std::string& key,
-      const int max_inclusive_version,
-      const std::string& domain,
-      const ONNX_NAMESPACE::OpSchema** latest_schema,
-      int* earliest_opset_where_unchanged) const override;
+  void GetSchemaAndHistory(const std::string& key, int max_inclusive_version, const std::string& domain,
+                           const ONNX_NAMESPACE::OpSchema** latest_schema,
+                           int* earliest_opset_where_unchanged) const override;
 
  private:
+  void GetDomainToVersionMapForRegistries(DomainToVersionMap& domain_version_map, bool is_onnx_only) const;
+
   std::deque<std::shared_ptr<IOnnxRuntimeOpSchemaCollection>> registries;
 };
 

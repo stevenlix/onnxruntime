@@ -48,7 +48,7 @@ Arguments:
 
     ldb (r9) - Supplies the first dimension of matrix B.
 
-    Beta (xmm0) - Supplies the scaler multiplier (see SGEMM definition).
+    Beta (xmm0) - Supplies the scalar beta multiplier (see SGEMM definition).
 
 Return Value:
 
@@ -56,8 +56,7 @@ Return Value:
 
 --*/
 
-        .globl  C_UNDERSCORE(MlasSgemmKernelM1TransposeBAvx)
-C_UNDERSCORE(MlasSgemmKernelM1TransposeBAvx):
+        FUNCTION_ENTRY MlasSgemmKernelM1TransposeBAvx
 
         push    rbx
         shl     r9,2                        # convert ldb to bytes

@@ -3,9 +3,11 @@
 
 #pragma once
 
+#ifndef SHARED_PROVIDER
 #include "core/common/status.h"
 #include "core/graph/graph_viewer.h"
-#include "gsl/span"
+#include "gsl/gsl"
+#endif
 
 #ifdef __has_attribute
 #define ORT_HAVE_ATTRIBUTE(x) __has_attribute(x)
@@ -37,13 +39,14 @@ class OpNodeProtoHelper {
 
   /**
      Get a single attribute
+     Call this function for a required attribute or when a default value for an optional attribute is specified in the op schema
   */
   template <typename T>
   MUST_USE_RESULT Status GetAttr(const std::string& name, T* value) const;
 
   /**
      Get a single attribute
-     Call this function only when onnx doesn't have default value
+     Call this function only when a default value for an optional attribute isn't specified in the op schema
   */
   template <typename T>
   T GetAttrOrDefault(const std::string& name, const T& default_value) const {
@@ -53,7 +56,7 @@ class OpNodeProtoHelper {
 
   /**
      Get a single attribute
-     Call this function only when onnx doesn't have default value
+     Call this function only when a default value for an optional attribute isn't specified in the op schema
   */
   template <typename T>
   void GetAttrOrDefault(const std::string& name, T* value, const T& default_value) const {
@@ -63,7 +66,7 @@ class OpNodeProtoHelper {
 
   /**
      Get repeated attributes
-     Call this function only when onnx doesn't have default value
+     Call this function only when a default value for an optional attribute isn't specified in the op schema
   */
   template <typename T>
   MUST_USE_RESULT std::vector<T> GetAttrsOrDefault(const std::string& name, const std::vector<T>& default_value = std::vector<T>{}) const {
@@ -79,6 +82,23 @@ class OpNodeProtoHelper {
 
   template <typename T>
   MUST_USE_RESULT Status GetAttrs(const std::string& name, gsl::span<T> values) const;
+
+  /// <summary>
+  /// Return a gsl::span that points to an array of primitive types held by AttributeProto
+  /// This function allows to avoid copying big attributes locally into a kernel and operate on
+  /// AttributeProto data directly.
+  ///
+  ///  Does not apply to strings, Tensors and Sparse Tensors that require special treatment.
+  /// </summary>
+  /// <typeparam name="T">Primitive type contained in the array</typeparam>
+  /// <param name="name">Attribute name</param>
+  /// <param name="values">Attribute data in a span, out parameter</param>
+  /// <returns>Status</returns>
+  template <typename T>
+  MUST_USE_RESULT Status GetAttrsAsSpan(const std::string& name, gsl::span<const T>& values) const;
+
+  MUST_USE_RESULT Status GetAttrsStringRefs(const std::string& name,
+                                            std::vector<std::reference_wrapper<const std::string>>& refs) const;
 
   uint32_t GetPrimitiveAttrElementCount(ONNX_NAMESPACE::AttributeProto_AttributeType type,
                                         const std::string& name) const noexcept;

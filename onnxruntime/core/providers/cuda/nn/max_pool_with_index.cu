@@ -29,6 +29,9 @@ __global__ void MaxPoolWithIndexKernel(
     int64_t pad_h,
     int64_t pad_w,
     int64_t pad_d,
+    int64_t dilation_h,
+    int64_t dilation_w,
+    int64_t dilation_d,
     fast_divmod fdm_c,
     fast_divmod fdm_h,
     fast_divmod fdm_w,
@@ -51,9 +54,9 @@ __global__ void MaxPoolWithIndexKernel(
   int64_t w_start = w_index * stride_w - pad_w;
   int64_t h_start = h_index * stride_h - pad_h;
 
-  int64_t d_end = _Min<int64_t>(d_start + kernel_d, depth);
-  int64_t w_end = _Min<int64_t>(w_start + kernel_w, width);
-  int64_t h_end = _Min<int64_t>(h_start + kernel_h, height);
+  int64_t d_end = _Min<int64_t>(d_start + (kernel_d - 1) * dilation_d + 1, depth);
+  int64_t w_end = _Min<int64_t>(w_start + (kernel_w - 1) * dilation_w + 1, width);
+  int64_t h_end = _Min<int64_t>(h_start + (kernel_h - 1) * dilation_h + 1, height);
 
   d_start = _Max<int64_t>(d_start, 0);
   w_start = _Max<int64_t>(w_start, 0);
@@ -64,9 +67,9 @@ __global__ void MaxPoolWithIndexKernel(
   int64_t offset = (n_index * channels + c_index) * height * width * depth;
   const T* p_slice = p_input + offset;
   T maxval = p_slice[h_start * width * depth + w_start * depth + d_start] - (T)1;
-  for (int64_t d = d_start; d < d_end; ++d) {
-    for (int64_t w = w_start; w < w_end; ++w) {
-      for (int64_t h = h_start; h < h_end; ++h) {
+  for (int64_t d = d_start; d < d_end; d += dilation_d) {
+    for (int64_t w = w_start; w < w_end; w += dilation_w) {
+      for (int64_t h = h_start; h < h_end; h += dilation_h) {
         if (p_slice[h * width * depth + w * depth + d] > maxval) {
           h_index_max = h;
           w_index_max = w;
@@ -77,22 +80,25 @@ __global__ void MaxPoolWithIndexKernel(
     }
   }
   p_output[id] = p_input[offset + h_index_max * width * depth + w_index_max * depth + d_index_max];
-  p_indices[id] = storage_order == 0 ? offset + h_index_max * width * depth + w_index_max * depth + d_index_max
-                                     : offset + h_index_max + w_index_max * height + d_index_max * width * height;
+  if (p_indices) {
+    p_indices[id] = storage_order == 0 ? offset + h_index_max * width * depth + w_index_max * depth + d_index_max
+                                       : offset + h_index_max + w_index_max * height + d_index_max * width * height;
+  }
 }
 
 template <typename T>
 void MaxPoolWithIndex(
+    cudaStream_t stream,
     const TensorShape& input_shape,
     const TensorShape& output_shape,
     const std::vector<int64_t>& kernel_shape,
     const std::vector<int64_t>& stride_shape,
     const std::vector<int64_t>& pads,
+    const std::vector<int64_t>& dilations,
     int64_t storage_order,
     const T* p_input,
     T* p_output,
     int64_t* p_indices) {
-  size_t input_dim_count = input_shape.NumDimensions();
 
   int64_t batchs = input_shape[0];
   int64_t channels = input_shape[1];
@@ -112,8 +118,11 @@ void MaxPoolWithIndex(
   //where xi_begin the number of pixels added at the beginning of axis i
   //and xi_end, the number of pixels added at the end of axis i.
   int64_t pad_h = pads[0];
-  int64_t pad_w = pads.size() == 4 ? pads[1] : 0;
+  int64_t pad_w = pads.size() >= 4 ? pads[1] : 0;
   int64_t pad_d = pads.size() == 6 ? pads[2] : 0;
+  int64_t dilation_h = dilations[0];
+  int64_t dilation_w = dilations.size() >= 2 ? dilations[1] : 1;
+  int64_t dilation_d = dilations.size() == 3 ? dilations[2] : 1;
   int64_t output_size = output_shape.Size();
 
   fast_divmod fdm_c(static_cast<int>(channels));
@@ -122,7 +131,7 @@ void MaxPoolWithIndex(
   fast_divmod fdm_d(static_cast<int>(pooled_depth));
 
   int blocksPerGrid = (int)((output_size + GridDim::maxThreadsPerBlock - 1) / GridDim::maxThreadsPerBlock);
-  MaxPoolWithIndexKernel<<<blocksPerGrid, GridDim::maxThreadsPerBlock>>>(
+  MaxPoolWithIndexKernel<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, stream>>>(
       batchs,
       channels,
       height,
@@ -140,6 +149,9 @@ void MaxPoolWithIndex(
       pad_h,
       pad_w,
       pad_d,
+      dilation_h,
+      dilation_w,
+      dilation_d,
       fdm_c,
       fdm_h,
       fdm_w,
@@ -153,11 +165,13 @@ void MaxPoolWithIndex(
 
 #define INSTANTIATEMAXPOOLWITHINDEX(T)          \
   template void MaxPoolWithIndex<T>(            \
+      cudaStream_t stream,                \
       const TensorShape& input_shape,           \
       const TensorShape& output_shape,          \
       const std::vector<int64_t>& kernel_shape, \
       const std::vector<int64_t>& stride_shape, \
       const std::vector<int64_t>& pads,         \
+      const std::vector<int64_t>& dilations,    \
       int64_t storage_order,                    \
       const T* p_input,                         \
       T* p_output,                              \
@@ -166,6 +180,8 @@ void MaxPoolWithIndex(
 INSTANTIATEMAXPOOLWITHINDEX(float)
 INSTANTIATEMAXPOOLWITHINDEX(double)
 INSTANTIATEMAXPOOLWITHINDEX(half)
+INSTANTIATEMAXPOOLWITHINDEX(int8_t)
+INSTANTIATEMAXPOOLWITHINDEX(uint8_t)
 
 }  // namespace cuda
 }  // namespace onnxruntime

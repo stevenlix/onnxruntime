@@ -7,9 +7,19 @@
 namespace onnxruntime {
 namespace test {
 
+TEST(MurmurHash3OpTest, UnsupportedInputType) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<int8_t>("X", {1}, {3});
+  test.AddAttribute<int64_t>("positive", 0);
+  test.AddOutput<int32_t>("Y", {1}, {847579505L});
+  // Unsupported input type
+  test.Run(OpTester::ExpectResult::kExpectFailure);
+}
+
 TEST(MurmurHash3OpTest, DefaultSeed) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<int32_t>("X", {1}, {3L});
+  test.AddAttribute<int64_t>("positive", 0);
   test.AddOutput<int32_t>("Y", {1}, {847579505L});
   test.Run();
 }
@@ -18,6 +28,7 @@ TEST(MurmurHash3OpTest, ZeroSeed) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<int32_t>("X", {1}, {3L});
   test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddAttribute<int64_t>("positive", 0);
   test.AddOutput<int32_t>("Y", {1}, {847579505L});
   test.Run();
 }
@@ -38,7 +49,31 @@ TEST(MurmurHash3OpTest, ZeroSeedUIntResult2) {
   test.Run();
 }
 
-TEST(MurmurHash3OpTest, MoreData) {
+TEST(MurmurHash3OpTest, ZeroSeedUIntResult3) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<int64_t>("X", {1}, {4LL});
+  test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddOutput<uint32_t>("Y", {1}, {3491892518L});
+  test.Run();
+}
+
+TEST(MurmurHash3OpTest, ZeroSeedFloatResult) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<float>("X", {1}, {3.});
+  test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddOutput<uint32_t>("Y", {1}, {6814352L});
+  test.Run();
+}
+
+TEST(MurmurHash3OpTest, ZeroSeedDoubleResult) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<double>("X", {1}, {3.});
+  test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddOutput<uint32_t>("Y", {1}, {3554953595L});
+  test.Run();
+}
+
+TEST(MurmurHash3OpTest, MoreDataInt) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<int32_t>("X", {2}, {3L, 4L});
   test.AddAttribute<int64_t>("seed", 0LL);
@@ -46,10 +81,19 @@ TEST(MurmurHash3OpTest, MoreData) {
   test.Run();
 }
 
-TEST(MurmurHash3OpTest,NonZeroSeed) {
+TEST(MurmurHash3OpTest, MoreDataFloat) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<float>("X", {2}, {3., 4.});
+  test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddOutput<uint32_t>("Y", {2}, {6814352L, 313312394L});
+  test.Run();
+}
+
+TEST(MurmurHash3OpTest, NonZeroSeed) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<int32_t>("X", {1}, {3L});
   test.AddAttribute<int64_t>("seed", 42LL);
+  test.AddAttribute<int64_t>("positive", 0);
   test.AddOutput<int32_t>("Y", {1}, {-1823081949L});
   test.Run();
 }
@@ -66,6 +110,7 @@ TEST(MurmurHash3OpTest, StringKeyIntResult) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<std::string>("X", {1}, {"foo"});
   test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddAttribute<int64_t>("positive", 0);
   test.AddOutput<int32_t>("Y", {1}, {-156908512L});
   test.Run();
 }
@@ -78,10 +123,19 @@ TEST(MurmurHash3OpTest, StringKeyUIntResult) {
   test.Run();
 }
 
+TEST(MurmurHash3OpTest, MultipleStringsKeyUIntResult) {
+  OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
+  test.AddInput<std::string>("X", {2}, {"foo", "bar"});
+  test.AddAttribute<int64_t>("seed", 0LL);
+  test.AddOutput<uint32_t>("Y", {2}, {4138058784L, 1158584717L});
+  test.Run();
+}
+
 TEST(MurmurHash3OpTest, StringKeyIntWithSeed42) {
   OpTester test("MurmurHash3", 1, onnxruntime::kMSDomain);
   test.AddInput<std::string>("X", {1}, {"foo"});
   test.AddAttribute<int64_t>("seed", 42LL);
+  test.AddAttribute<int64_t>("positive", 0);
   test.AddOutput<int32_t>("Y", {1}, {-1322301282L});
   test.Run();
 }

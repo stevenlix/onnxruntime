@@ -2,27 +2,26 @@
 // Licensed under the MIT License.
 
 #include "core/providers/cpu/ml/svmclassifier.h"
+#include "core/platform/threadpool.h"
 
 namespace onnxruntime {
 namespace ml {
 
-#define ADD_IN_TYPE_SVM_CLASSIFIER_OP(in_type)                                                                                                                                                    \
-  ONNX_CPU_OPERATOR_TYPED_ML_KERNEL(                                                                                                                                                              \
-      SVMClassifier,                                                                                                                                                                              \
-      1,                                                                                                                                                                                          \
-      in_type,                                                                                                                                                                                    \
-      KernelDefBuilder().TypeConstraint("T1", DataTypeImpl::GetTensorType<in_type>()).TypeConstraint("T2", {DataTypeImpl::GetTensorType<int64_t>(), DataTypeImpl::GetTensorType<std::string>()}), \
-      SVMClassifier<in_type>);
+ONNX_CPU_OPERATOR_ML_KERNEL(
+    SVMClassifier,
+    1,
+    KernelDefBuilder()
+        .TypeConstraint("T1", std::vector<MLDataType>{
+                                  DataTypeImpl::GetTensorType<float>(),
+                                  DataTypeImpl::GetTensorType<double>(),
+                                  DataTypeImpl::GetTensorType<int32_t>(),
+                                  DataTypeImpl::GetTensorType<int64_t>()})
+        .TypeConstraint("T2", {DataTypeImpl::GetTensorType<int64_t>(), DataTypeImpl::GetTensorType<std::string>()}),
+    SVMClassifier);
 
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(float);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(double);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(int64_t);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(int32_t);
-
-template <typename T>
-SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
+SVMClassifier::SVMClassifier(const OpKernelInfo& info)
     : OpKernel(info),
-      SVMCommon<T>(info),
+      SVMCommon(info),
       vectors_per_class_(info.GetAttrsOrDefault<int64_t>("vectors_per_class")),
       proba_(info.GetAttrsOrDefault<float>("prob_a")),
       probb_(info.GetAttrsOrDefault<float>("prob_b")),
@@ -55,6 +54,7 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
   } else {
     class_count_ = 1;
   }
+
   if (vector_count_ > 0) {
     feature_count_ = support_vectors_.size() / vector_count_;  //length of each support vector
     mode_ = SVM_TYPE::SVM_SVC;
@@ -63,193 +63,321 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
     mode_ = SVM_TYPE::SVM_LINEAR;
     set_kernel_type(KERNEL::LINEAR);
   }
+
   ORT_ENFORCE(classlabels_strings_.size() > 0 || classlabels_ints_.size() > 0);
   ORT_ENFORCE(proba_.size() == probb_.size());
   ORT_ENFORCE(coefficients_.size() > 0);
-  weights_are_all_positive_ = true;
-  for (int64_t i = 0; i < static_cast<int64_t>(coefficients_.size()); i++) {
-    if (coefficients_[i] < 0) {
-      weights_are_all_positive_ = false;
-      break;
+  weights_are_all_positive_ = std::all_of(coefficients_.cbegin(), coefficients_.cend(),
+                                          [](float value) { return value >= 0.f; });
+}
+
+template <typename LabelType>
+static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weight, const int64_t maxclass,
+                        bool have_proba, bool weights_are_all_positive,
+                        const std::vector<LabelType>& classlabels,
+                        const LabelType& posclass, const LabelType& negclass) {
+  LabelType& output_data = *(output.template MutableData<LabelType>() + output_idx);
+
+  if (classlabels.size() == 2) {
+    if (!have_proba) {
+      if (weights_are_all_positive && max_weight >= 0.5)
+        output_data = classlabels[1];
+      else if (max_weight > 0 && !weights_are_all_positive)
+        output_data = classlabels[1];
+      else
+        output_data = classlabels[maxclass];
+    } else {
+      output_data = classlabels[maxclass];
     }
+  } else if (max_weight > 0) {
+    output_data = posclass;
+  } else {
+    output_data = negclass;
   }
 }
 
-template <typename T>
-Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
-  const Tensor* X = ctx->Input<Tensor>(0);
+Status SVMClassifier::Compute(OpKernelContext* ctx) const {
+  Status status = Status::OK();
+  const auto& X = *ctx->Input<Tensor>(0);
+  const auto& x_shape = X.Shape();
 
-  int64_t stride = X->Shape().NumDimensions() == 1 ? X->Shape()[0] : X->Shape()[1];
-  int64_t N = X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0];
+  AllocatorPtr allocator;
+  auto element_type = X.GetElementType();
+  gsl::span<const float> x_data;
+  float* tmp_data = nullptr;
 
-  Tensor* Y = ctx->Output(0, TensorShape({N}));
-  Tensor* Z;
+  if (element_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    x_data = X.DataAsSpan<float>();
+  } else {
+    // need to cast the input to float so we can use the fast GEMM implementations
+    auto num_elements = x_shape.Size();
 
-  std::vector<int64_t> dims;
-  if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() == 0)
-    dims = {static_cast<int64_t>(N), static_cast<int64_t>(class_count_ * (class_count_ - 1) / 2)};
-  else
-    dims = {static_cast<int64_t>(N), static_cast<int64_t>(class_count_)};
-  Z = ctx->Output(1, TensorShape(dims));
+    ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&allocator));
+    tmp_data = static_cast<float*>(allocator->AllocArray(num_elements, sizeof(float)));
 
-  const auto* x_data = X->template Data<T>();
-  int64_t zindex = 0;
-
-  for (int64_t n = 0; n < N; n++)  //for each example
-  {
-    int64_t current_weight_0 = n * stride;
-    int64_t maxclass = -1;
-    double maxweight = 0.f;
-    std::vector<float> decisions;
-    std::vector<float> scores;
-    std::vector<float> kernels;
-    std::vector<int64_t> votes;
-
-    if (mode_ == SVM_TYPE::SVM_SVC) {
-      for (int64_t j = 0; j < vector_count_; j++) {
-        float val = kernel_dot(x_data, current_weight_0, support_vectors_, feature_count_ * j, feature_count_, get_kernel_type());
-        kernels.push_back(val);
+    switch (element_type) {
+      case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE: {
+        auto in_vector = ConstEigenVectorMap<double>(X.Data<double>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
       }
-      for (int64_t j = 0; j < class_count_; j++) {
-        votes.push_back(0);
+      case ONNX_NAMESPACE::TensorProto_DataType_INT32: {
+        auto in_vector = ConstEigenVectorMap<int32_t>(X.Data<int32_t>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
       }
-      int evals = 0;
-      for (int64_t i = 0; i < class_count_; i++) {        //for each class
-        for (int64_t j = i + 1; j < class_count_; j++) {  //for each class
-          float sum = 0;
-          int64_t start_index_i = starting_vector_[i];  // *feature_count_;
-          int64_t start_index_j = starting_vector_[j];  // *feature_count_;
-
-          int64_t class_i_support_count = vectors_per_class_[i];
-          int64_t class_j_support_count = vectors_per_class_[j];
-
-          int64_t pos1 = (vector_count_) * (j - 1);
-          int64_t pos2 = (vector_count_) * (i);
-          for (int64_t m = 0; m < class_i_support_count; m++) {
-            float val1 = coefficients_[pos1 + start_index_i + m];
-            float val2 = kernels[start_index_i + m];
-            sum += val1 * val2;
-          }
-          for (int64_t m = 0; m < class_j_support_count; m++) {
-            float val1 = coefficients_[pos2 + start_index_j + m];
-            float val2 = kernels[start_index_j + m];
-            sum += val1 * val2;
-          }
-
-          sum += rho_[evals];
-          scores.push_back(sum);
-          if (sum > 0) {
-            votes[i]++;
-          } else {
-            votes[j]++;
-          }
-          evals++;  //index into rho
-        }
+      case ONNX_NAMESPACE::TensorProto_DataType_INT64: {
+        auto in_vector = ConstEigenVectorMap<int64_t>(X.Data<int64_t>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
       }
-    } else if (mode_ == SVM_TYPE::SVM_LINEAR) {     //liblinear
-      for (int64_t j = 0; j < class_count_; j++) {  //for each class
-        float val = kernel_dot(x_data, current_weight_0, coefficients_, feature_count_ * j, feature_count_, get_kernel_type());
-        val += rho_[0];
-        scores.push_back(val);
-      }
+      default:
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Unsupported data type of ", element_type);
     }
-    if (proba_.size() > 0 && mode_ == SVM_TYPE::SVM_SVC) {
-      //compute probabilities from the scores
-      std::vector<float> estimates;
-      std::vector<float> probsp2;
-      int64_t num = class_count_ * class_count_;
-      for (int64_t m = 0; m < num; m++) {
-        probsp2.push_back(0.f);  //min prob
-      }
-      for (int64_t m = 0; m < class_count_; m++) {
-        estimates.push_back(0.f);  //min prob
-      }
-      int64_t index = 0;
-      for (int64_t i = 0; i < class_count_; i++) {
-        for (int64_t j = i + 1; j < class_count_; j++) {
-          float val1 = sigmoid_probability(scores[index], proba_[index], probb_[index]);
-          float val2 = std::max(val1, 1.0e-7f);
-          probsp2[i * class_count_ + j] = std::min(val2, 1 - 1.0e-7f);
-          probsp2[j * class_count_ + i] = 1 - probsp2[i * class_count_ + j];
-          index++;
-        }
-      }
-      multiclass_probability(class_count_, probsp2, estimates);
-      //copy probabilities back into scores
-      scores.resize(estimates.size());
-      for (int64_t k = 0; k < static_cast<int64_t>(estimates.size()); k++) {
-        scores[k] = estimates[k];
-      }
+
+    x_data = gsl::make_span<const float>(tmp_data, num_elements);
+  }
+
+  status = ComputeImpl(*ctx, x_data, x_shape);
+
+  if (element_type != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    allocator->Free(tmp_data);
+  }
+
+  return status;
+}
+
+Status SVMClassifier::ComputeImpl(OpKernelContext& ctx,
+                                  gsl::span<const float> x_data, const TensorShape& x_shape) const {
+  concurrency::ThreadPool* threadpool = ctx.GetOperatorThreadPool();
+
+  const auto num_batches = SafeInt<int32_t>(x_shape.NumDimensions() == 1 ? 1 : x_shape[0]);
+
+  // Total number of classifiers comparing pairs between the classes
+  // e.g. if you have A, B C and D classes, the number of classifiers to compare between each pair is 6
+  //      with AB, AC, AD, BC, BD and CD
+  const int64_t num_classifiers = class_count_ * (class_count_ - 1) / 2;  // == (class_count_-1)!
+  const int64_t class_count_squared = class_count_ * class_count_;
+  const bool have_proba = proba_.size() > 0;
+
+  int64_t final_scores_per_batch = class_count_;
+  if (mode_ == SVM_TYPE::SVM_SVC && !have_proba) {
+    if (class_count_ > 2)
+      final_scores_per_batch = num_classifiers;
+    else
+      final_scores_per_batch = 2;
+  }
+
+  // Input shapes
+  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
+  // coefficients_: if linear [class_count, feature_count]
+  //                else      [num_classes - 1, vector_count_]
+  // support_vectors_ : [vector_count_, feature_count_]
+
+  // both outputs are required so can't be nullptr
+  Tensor& Y = *ctx.Output(0, {num_batches});
+  Tensor& Z = *ctx.Output(1, {num_batches, final_scores_per_batch});
+
+  auto final_scores = Z.MutableDataAsSpan<float>();
+
+  std::vector<float> kernels_data;
+  std::vector<int64_t> votes_data;
+
+  std::vector<float> classifier_scores_data;
+  std::vector<float> probsp2_data;
+
+  if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
+    probsp2_data.resize(num_batches * class_count_squared, 0.f);
+  }
+
+  int write_additional_scores = -1;
+  int64_t num_scores_per_batch = class_count_;
+
+  if (mode_ == SVM_TYPE::SVM_SVC && !have_proba) {
+    num_scores_per_batch = num_classifiers;
+    if (class_count_ <= 2) {
+      write_additional_scores = post_transform_ == POST_EVAL_TRANSFORM::NONE ? 2 : 0;
     }
-    int64_t maxvotes = 0;
-    if (votes.size() > 0) {
-      for (int64_t k = 0; k < static_cast<int64_t>(votes.size()); k++) {
-        if (votes[k] > maxvotes) {
-          maxvotes = votes[k];
-          maxclass = k;
-        }
-      }
+  }
+
+  if (mode_ == SVM_TYPE::SVM_LINEAR) {
+    // scores_data.resize(num_batches * class_count_);
+    // auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
+
+    // combine the coefficients with the input data and apply the kernel type
+    batched_kernel_dot<float>(x_data, coefficients_, num_batches, class_count_, feature_count_, rho_[0], final_scores,
+                              threadpool);
+
+  } else {
+    gsl::span<float> classifier_scores;
+
+    // if we have one classifier, are writing directly to the final buffer,
+    // and will add an additional score in the results, leave a space between each classifier score so that
+    // we can parallelize the batch processing below.
+    int64_t num_slots_per_iteration = write_additional_scores >= 0 ? 2 : num_classifiers;
+
+    if (have_proba) {
+      // we will write num_batches * num_classifiers scores first, and transform those to num_batches * class_count_,
+      // so need to use a separate buffer for the first scoring.
+      classifier_scores_data.resize(num_batches * num_classifiers);
+      classifier_scores = gsl::make_span<float>(classifier_scores_data.data(), classifier_scores_data.size());
     } else {
-      for (int64_t k = 0; k < static_cast<int64_t>(scores.size()); k++) {
-        if (scores[k] > maxweight) {
-          maxclass = k;
-          maxweight = scores[k];
+      // we will write directly to the final scores buffer
+      // num_scores_per_batch = num_classifiers;
+      // assert(num_scores_per_batch == final_scores_per_batch);
+      classifier_scores = final_scores;
+    }
+
+    kernels_data.resize(num_batches * vector_count_);
+    votes_data.resize(num_batches * class_count_, 0);
+
+    auto kernels_span = gsl::make_span<float>(kernels_data.data(), kernels_data.size());
+    auto votes_span = gsl::make_span<int64_t>(votes_data.data(), votes_data.size());
+
+    // combine the input data with the support vectors and apply the kernel type
+    // output is {num_batches, vector_count_}
+    batched_kernel_dot<float>(x_data, support_vectors_, num_batches, vector_count_, feature_count_, 0.f, kernels_span,
+                              threadpool);
+
+    for (int64_t n = 0; n < num_batches; n++) {
+      // reduce scores from kernels using coefficients, taking into account the varying number of support vectors
+      // per class.
+      // coefficients: [num_classes - 1, vector_count_]
+      //
+      // e.g. say you have 3 classes, with 3 x 3 coefficients
+      //
+      // AA AB AC
+      // BA BB BC
+      // CA CB CC
+      //
+      // you can remove the diagonal line of items comparing a class with itself leaving one less row.
+      //
+      // BA AB AC
+      // CA CB BC
+      //
+      // for each class there is a coefficient per support vector, and a class has one or more support vectors.
+      //
+      // Combine the scores for the two combinations for two classes with their coefficient.
+      // e.g. AB combines with BA.
+      // If A has 3 support vectors and B has 2, there's a 3x2 block for AB and a 2x3 block for BA to combine
+
+      auto cur_kernels = kernels_span.subspan(n * vector_count_, vector_count_);
+      auto cur_scores = classifier_scores.subspan(n * num_slots_per_iteration, num_classifiers);
+      auto cur_votes = votes_span.subspan(n * class_count_, class_count_);
+      auto scores_iter = cur_scores.begin();
+
+      int64_t classifier_idx = 0;
+      for (int64_t i = 0; i < class_count_ - 1; i++) {
+        int64_t start_index_i = starting_vector_[i];  // start of support vectors for class i
+        int64_t class_i_support_count = vectors_per_class_[i];
+        int64_t i_coeff_row_offset = vector_count_ * i;
+
+        for (int64_t j = i + 1; j < class_count_; j++) {
+          int64_t start_index_j = starting_vector_[j];  // start of support vectors for class j
+          int64_t class_j_support_count = vectors_per_class_[j];
+          int64_t j_coeff_row_offset = vector_count_ * (j - 1);
+
+          double sum = 0;
+
+          const float* val1 = &(coefficients_[j_coeff_row_offset + start_index_i]);
+          const float* val2 = &(cur_kernels[start_index_i]);
+          for (int64_t m = 0; m < class_i_support_count; ++m, ++val1, ++val2)
+            sum += *val1 * *val2;
+
+          val1 = &(coefficients_[i_coeff_row_offset + start_index_j]);
+          val2 = &(cur_kernels[start_index_j]);
+
+          for (int64_t m = 0; m < class_j_support_count; ++m, ++val1, ++val2)
+            sum += *val1 * *val2;
+
+          sum += rho_[classifier_idx++];
+
+          *scores_iter++ = static_cast<float>(sum);
+          ++(cur_votes[sum > 0 ? i : j]);
         }
       }
     }
-    //write top class
-    int write_additional_scores = -1;
-    if (rho_.size() == 1)  //binary
-    {
+  }
+
+  auto finalize_batch = [this, &final_scores, final_scores_per_batch,
+                         have_proba, &probsp2_data, class_count_squared,
+                         &classifier_scores_data, num_classifiers, &votes_data, &Y,
+                         num_scores_per_batch, write_additional_scores](ptrdiff_t idx) {
+    int n = SafeInt<int32_t>(idx);  // convert to a usable sized type
+    auto cur_scores = final_scores.subspan(n * final_scores_per_batch, final_scores_per_batch);
+
+    if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
+      auto probsp2 = gsl::make_span<float>(probsp2_data.data() + (n * class_count_squared), class_count_squared);
+
+      float* classifier_scores = classifier_scores_data.data() + (n * num_classifiers);
+
+      int64_t index = 0;
+      for (int64_t i = 0; i < class_count_ - 1; ++i) {
+        int64_t p1 = i * class_count_ + i + 1;
+        int64_t p2 = (i + 1) * class_count_ + i;
+        for (int64_t j = i + 1; j < class_count_; ++j, ++index) {
+          float val1 = sigmoid_probability(classifier_scores[index], proba_[index], probb_[index]);
+          float val2 = std::max(val1, 1.0e-7f);
+          val2 = std::min(val2, 1 - 1.0e-7f);
+          probsp2[p1] = val2;
+          probsp2[p2] = 1 - val2;
+          ++p1;
+          p2 += class_count_;
+        }
+      }
+
+      // expand scores from num_classifiers to class_count_
+      multiclass_probability(class_count_, probsp2, cur_scores);
+    }
+
+    float max_weight = 0;
+    int64_t maxclass = -1;
+    if (votes_data.size() > 0) {
+      auto votes = gsl::make_span<int64_t>(votes_data.data() + (n * class_count_), class_count_);
+      auto it_maxvotes = std::max_element(votes.cbegin(), votes.cend());
+      maxclass = std::distance(votes.cbegin(), it_maxvotes);
+    } else {
+      auto it_max_weight = std::max_element(cur_scores.cbegin(), cur_scores.cend());
+      maxclass = std::distance(cur_scores.cbegin(), it_max_weight);
+      max_weight = *it_max_weight;
+    }
+
+    // write top class
+    // onnx specs expects one column per class.
+    if (num_classifiers == 1) {  // binary case
       if (using_strings_) {
-        if (classlabels_strings_.size() == 2 && weights_are_all_positive_ && maxweight >= 0.5 && proba_.size() == 0) {
-          Y->template MutableData<std::string>()[n] = classlabels_strings_[1];  //positive label
-          write_additional_scores = 0;
-        } else if (classlabels_strings_.size() == 2 && maxweight > 0 && !weights_are_all_positive_ && proba_.size() == 0) {
-          Y->template MutableData<std::string>()[n] = classlabels_strings_[1];  //positive label
-          write_additional_scores = 0;
-        } else if (classlabels_strings_.size() == 2 && proba_.size() > 0) {            //this case all classes are in their rightful spot
-          Y->template MutableData<std::string>()[n] = classlabels_strings_[maxclass];  //whichever label
-          write_additional_scores = -1;
-        } else if (classlabels_strings_.size() == 2) {
-          Y->template MutableData<std::string>()[n] = classlabels_strings_[0];  //negative label
-          write_additional_scores = 1;
-        } else if (maxweight > 0) {
-          Y->template MutableData<std::string>()[n] = "1";  //positive label
-        } else {
-          Y->template MutableData<std::string>()[n] = "0";  //negative label
-        }
-      } else  //no strings
-      {
-        if (classlabels_ints_.size() == 2 && weights_are_all_positive_ && maxweight >= 0.5 && proba_.size() == 0) {
-          Y->template MutableData<int64_t>()[n] = classlabels_ints_[1];  //positive label
-          write_additional_scores = 0;
-        } else if (classlabels_ints_.size() == 2 && maxweight > 0 && !weights_are_all_positive_ && proba_.size() == 0) {
-          Y->template MutableData<int64_t>()[n] = classlabels_ints_[0];  //pos  label
-          write_additional_scores = 0;
-        } else if (classlabels_ints_.size() == 2 && proba_.size() > 0)  //this case all classes are in their rightful spot
-        {
-          Y->template MutableData<int64_t>()[n] = classlabels_ints_[maxclass];  //whichever label
-          write_additional_scores = -1;
-        } else if (classlabels_ints_.size() == 2) {
-          Y->template MutableData<int64_t>()[n] = classlabels_ints_[0];  //negative label
-          write_additional_scores = 1;
-        } else if (maxweight > 0) {
-          Y->template MutableData<int64_t>()[n] = 1;  //positive label
-        } else {
-          Y->template MutableData<int64_t>()[n] = 0;  //negative label
-        }
+        ChooseClass<std::string>(Y, n, max_weight, maxclass, have_proba, weights_are_all_positive_,
+                                 classlabels_strings_, "1", "0");
+      } else {
+        ChooseClass<int64_t>(Y, n, max_weight, maxclass, have_proba, weights_are_all_positive_,
+                             classlabels_ints_, 1, 0);
       }
     } else {  //multiclass
       if (using_strings_) {
-        Y->template MutableData<std::string>()[n] = classlabels_strings_[maxclass];
+        Y.template MutableData<std::string>()[n] = classlabels_strings_[maxclass];
       } else {
-        Y->template MutableData<int64_t>()[n] = classlabels_ints_[maxclass];
+        Y.template MutableData<int64_t>()[n] = classlabels_ints_[maxclass];
       }
     }
 
-    write_scores(scores, post_transform_, zindex, Z, write_additional_scores);
-    zindex += scores.size();
+    // write the score for this batch
+    // as we parallelize the batch processing we want to update the final scores for each batch in the separate threads
+    batched_update_scores_inplace<float>(cur_scores, 1, num_scores_per_batch, post_transform_,
+                                         write_additional_scores, true, nullptr);
+  };
+
+  // TODO: Refine this rough metric to choose when to parallelize.
+  if (num_batches > 512) {
+    concurrency::ThreadPool::TryBatchParallelFor(threadpool, num_batches, finalize_batch, -1);
+  } else {
+    {
+      for (ptrdiff_t i = 0; i < num_batches; ++i) {
+        finalize_batch(i);
+      }
+    }
   }
 
   return Status::OK();

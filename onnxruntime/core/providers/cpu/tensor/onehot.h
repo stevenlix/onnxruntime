@@ -8,15 +8,18 @@
 
 namespace onnxruntime {
 
+Status ValidateInputs(const Tensor* depth, const Tensor* values);
+
+Status PrepareOutputShape(const Tensor* indices, const int64_t depth_val, const int64_t axis,
+                          int64_t& prefix_dim_size, int64_t& suffix_dim_size,
+                          std::vector<int64_t>& output_shape);
+
 template <typename in_type, typename out_type, typename depth_type>
 class OneHotOp final : public OpKernel {
  public:
   explicit OneHotOp(const OpKernelInfo& op_kernel_info) : OpKernel(op_kernel_info) {
     int64_t tmp_axis;
     if (op_kernel_info.GetAttr<int64_t>("axis", &tmp_axis).IsOK()) {
-      if (tmp_axis < -1) {  // as per spec it can be -1 or more
-        ORT_THROW("Value of axis is < -1");
-      }
       axis_ = tmp_axis;
     }
   }

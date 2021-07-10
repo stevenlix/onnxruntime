@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/providers/shared_library/provider_api.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/math/unary_elementwise_ops.h"
 #include "core/providers/cuda/math/binary_elementwise_ops.h"
@@ -39,23 +40,6 @@ namespace cuda {
     CtxNull ctx;                       \
     return ctx;                        \
   }
-
-template <typename T>
-class Affine final : public UnaryElementwise {
- public:
-  Affine(const OpKernelInfo& info) : UnaryElementwise(info) {
-    ORT_ENFORCE(info.GetAttr("alpha", &alpha_).IsOK());
-    ORT_ENFORCE(info.GetAttr("beta", &beta_).IsOK());
-  }
-
-  Status ComputeInternal(OpKernelContext* context) const override;
-
- private:
-  MAKE_FUNC_CTX_ALPHA_BETA()
-
-  float alpha_;
-  float beta_;
-};
 
 template <typename T>
 class Elu final : public UnaryElementwise {
@@ -105,23 +89,6 @@ class LeakyRelu final : public UnaryElementwise {
 };
 
 template <typename T>
-class ParametricSoftplus final : public UnaryElementwise {
- public:
-  ParametricSoftplus(const OpKernelInfo& info) : UnaryElementwise(info) {
-    ORT_ENFORCE(info.GetAttr("alpha", &alpha_).IsOK());
-    ORT_ENFORCE(info.GetAttr("beta", &beta_).IsOK());
-  }
-
-  Status ComputeInternal(OpKernelContext* context) const override;
-
- private:
-  MAKE_FUNC_CTX_ALPHA_BETA()
-
-  float alpha_;
-  float beta_;
-};
-
-template <typename T>
 class Relu final : public UnaryElementwise {
  public:
   Relu(const OpKernelInfo& info) : UnaryElementwise(info) {}
@@ -130,23 +97,6 @@ class Relu final : public UnaryElementwise {
 
  private:
   MAKE_FUNC_CTX_NULL()
-};
-
-template <typename T>
-class ScaledTanh final : public UnaryElementwise {
- public:
-  ScaledTanh(const OpKernelInfo& info) : UnaryElementwise(info) {
-    ORT_ENFORCE(info.GetAttr("alpha", &alpha_).IsOK());
-    ORT_ENFORCE(info.GetAttr("beta", &beta_).IsOK());
-  }
-
-  Status ComputeInternal(OpKernelContext* context) const override;
-
- private:
-  MAKE_FUNC_CTX_ALPHA_BETA()
-
-  float alpha_;
-  float beta_;
 };
 
 template <typename T>

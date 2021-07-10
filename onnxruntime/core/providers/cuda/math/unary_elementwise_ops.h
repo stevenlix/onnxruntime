@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 #pragma once
-#include "core/providers/cuda/cuda_common.h"
+#include "core/providers/cuda/cuda_kernel.h"
 
 namespace onnxruntime {
 namespace cuda {
@@ -74,6 +74,41 @@ template <typename T>
 class Exp final : public UnaryElementwise {
  public:
   Exp(const OpKernelInfo& info) : UnaryElementwise(info) {}
+  Status ComputeInternal(OpKernelContext* context) const override;
+};
+
+template <typename T>
+class Erf final : public UnaryElementwise {
+ public:
+  Erf(const OpKernelInfo& info) : UnaryElementwise(info) {}
+  Status ComputeInternal(OpKernelContext* context) const override;
+};
+
+template <typename T>
+class Not final : public UnaryElementwise {
+ public:
+  Not(const OpKernelInfo& info) : UnaryElementwise(info) {}
+  Status ComputeInternal(OpKernelContext* context) const override;
+};
+
+template <typename T>
+class Round final : public UnaryElementwise {
+ public:
+  Round(const OpKernelInfo& info) : UnaryElementwise(info) {}
+  Status ComputeInternal(OpKernelContext* context) const override;
+};
+
+template <typename T>
+class Sin final : public UnaryElementwise {
+ public:
+  Sin(const OpKernelInfo& info) : UnaryElementwise(info) {}
+  Status ComputeInternal(OpKernelContext* context) const override;
+};
+
+template <typename T>
+class Cos final : public UnaryElementwise {
+ public:
+  Cos(const OpKernelInfo& info) : UnaryElementwise(info) {}
   Status ComputeInternal(OpKernelContext* context) const override;
 };
 

@@ -5,7 +5,6 @@
 
 #include <limits>
 
-#include "core/framework/allocator.h"
 #include "core/framework/op_kernel.h"
 #include "core/providers/cpu/rnn/rnn_helpers.h"
 
@@ -45,11 +44,15 @@ class DeepCpuGruOp final : public OpKernel {
       }
     }
 
-    ORT_ENFORCE(activation_func_names.size() == num_directions_ * 2);
+    ORT_ENFORCE(activation_func_names.size() == static_cast<size_t>(num_directions_) * 2);
 
     activation_funcs_ = rnn::detail::ActivationFuncs(activation_func_names,
                                                      activation_func_alphas,
                                                      activation_func_betas);
+
+    layout_ = info.GetAttrOrDefault("layout", static_cast<int64_t>(0));
+    ORT_ENFORCE(layout_ == 0, 
+        "Batchwise recurrent operations (layout == 1) are not supported. If you need support create a github issue with justification.");
   }
 
   Status Compute(OpKernelContext* context) const override;
@@ -60,21 +63,12 @@ class DeepCpuGruOp final : public OpKernel {
   rnn::detail::Direction direction_;
   int num_directions_;
 
-  int hidden_size_ = 0;
+  int hidden_size_ {};
   float clip_;
-  int linear_before_reset_ = 0;
+  int linear_before_reset_ {};
+  int64_t layout_;
 
   rnn::detail::ActivationFuncs activation_funcs_;
-
-  // Threadpool for operator. If concurrent Compute calls are possible, it will be shared
-  // across them. mutable due to this.
-  // The alternative would be to create a threadpool in each call to Compute but that would incur thread creation
-  // cost on every call.
-#ifdef USE_EIGEN_THREADPOOL
-  mutable Eigen::NonBlockingThreadPool ttp_{static_cast<int>(std::thread::hardware_concurrency())};
-#else
-  mutable TaskThreadPool ttp_{std::thread::hardware_concurrency()};
-#endif
 
   template <typename T>
   Status ComputeImpl(OpKernelContext& context) const;

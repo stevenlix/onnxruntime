@@ -2,16 +2,23 @@
 // Licensed under the MIT License.
 
 #pragma once
-#include <iostream>
+
+#include <atomic>
 #include <fstream>
-#include <tuple>
 #include <initializer_list>
-#include "core/platform/ort_mutex.h"
+#include <iostream>
+#include <tuple>
+
 #include "core/common/logging/logging.h"
+#include "core/platform/ort_mutex.h"
 
 namespace onnxruntime {
 
 namespace profiling {
+
+// uncomment the macro below, or use -DENABLE_STATIC_PROFILER_INSTANCE for debugging
+// note that static profiler instance only works with single session
+//#define ENABLE_STATIC_PROFILER_INSTANCE
 
 /**
  * Main class for profiling. It continues to accumulate events and produce
@@ -22,6 +29,8 @@ class Profiler {
   /// turned off by default.
   /// Even this function is marked as noexcept, the code inside it may throw exceptions
   Profiler() noexcept {};  //NOLINT
+
+  ~Profiler();
 
   /*
   Initializes Profiler with the session logger to log framework specific messages
@@ -36,24 +45,36 @@ class Profiler {
   /*
   Start profiler and record beginning time.
   */
-  void StartProfiling(const std::string& file_name);
+  template <typename T>
+  void StartProfiling(const std::basic_string<T>& file_name);
 
   /*
   Produce current time point for any profiling action.
   */
   TimePoint StartTime() const;
 
-  bool FEnabled() const {
+  /*
+  Whether data collection and output from this profiler is enabled.
+  */
+  bool IsEnabled() const {
     return enabled_;
   }
-
+  /*
+  Return the stored start time of profiler.
+  On some platforms, this timer may not be as precise as nanoseconds
+  For instance, on Windows and MacOS, the precision (high_resolution_clock) will be ~100ns
+  */
+  uint64_t GetStartTimeNs() const {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      profiling_start_time_.time_since_epoch()).count();
+  }
   /*
   Record a single event. Time is measured till the call of this function from
   the start_time.
   */
   void EndTimeAndRecordEvent(EventCategory category,
                              const std::string& event_name,
-                             TimePoint& start_time,
+                             const TimePoint& start_time,
                              const std::initializer_list<std::pair<std::string, std::string>>& event_args = {},
                              bool sync_gpu = false);
 
@@ -63,8 +84,39 @@ class Profiler {
   */
   std::string EndProfiling();
 
+  static Profiler& Instance() {
+#ifdef ENABLE_STATIC_PROFILER_INSTANCE
+    ORT_ENFORCE(instance_ != nullptr);
+    return *instance_;
+#else
+    ORT_THROW("Static profiler instance is not enabled, please compile with -DENABLE_STATIC_PROFILER_INSTANCE");
+#endif
+  }
+
+  /*
+  Gets the maximum event count to set for new profiler instances.
+  */
+  static size_t GetGlobalMaxNumEvents() {
+    return global_max_num_events_.load();
+  }
+
+  /*
+  Sets the maximum event count to set for new profiler instances.
+  Existing profiler instances will not be affected.
+  */
+  static void SetGlobalMaxNumEvents(size_t new_max_num_events) {
+    global_max_num_events_.store(new_max_num_events);
+  }
+
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(Profiler);
+
+  /**
+   * The maximum number of profiler records to collect.
+   * This value is used to initialize the per-profiler maximum.
+   * It can be set, but won't affect existing profilers.
+   */
+  static std::atomic<size_t> global_max_num_events_;
 
   // Mutex controlling access to profiler data
   OrtMutex mutex_;
@@ -76,8 +128,12 @@ class Profiler {
   TimePoint profiling_start_time_;
   std::vector<EventRecord> events_;
   bool max_events_reached{false};
-  static constexpr size_t max_num_events_ = 1000000;
   bool profile_with_logger_{false};
+  const size_t max_num_events_{global_max_num_events_.load()};
+
+#ifdef ENABLE_STATIC_PROFILER_INSTANCE
+  static Profiler* instance_;
+#endif
 };
 
 }  // namespace profiling

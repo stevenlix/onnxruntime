@@ -24,8 +24,8 @@ namespace detail {
 using namespace ::onnxruntime::common;
 
 Status ValidateCommonRnnInputs(const Tensor& X,
-                               const Tensor& W,
-                               const Tensor& R,
+                               const TensorShape& W_shape,
+                               const TensorShape& R_shape,
                                const Tensor* B,
                                int WRB_dim_1_multipler,
                                const Tensor* sequence_lens,
@@ -33,8 +33,6 @@ Status ValidateCommonRnnInputs(const Tensor& X,
                                int64_t num_directions,
                                int64_t hidden_size) {
   auto& X_shape = X.Shape();
-  auto& W_shape = W.Shape();
-  auto& R_shape = R.Shape();
 
   int64_t seq_length = X_shape[0];
   int64_t batch_size = X_shape[1];
@@ -79,7 +77,7 @@ Status ValidateCommonRnnInputs(const Tensor& X,
     auto sequence_len_entries = sequence_lens->DataAsSpan<int>();
     if (std::any_of(sequence_len_entries.cbegin(),
                     sequence_len_entries.cend(),
-                    [seq_length](int len) { return len <= 0 || len > seq_length; })) {
+                    [seq_length](int len) { return len < 0 || len > seq_length; })) {
       return ORT_MAKE_STATUS(
           ONNXRUNTIME, INVALID_ARGUMENT,
           "Invalid value/s in sequence_lens. All values must be > 0 and < seq_length. seq_length=", seq_length);
@@ -178,7 +176,7 @@ ActivationFuncs::ActivationFuncs(const std::vector<std::string>& funcs,
   auto cur_beta = betas.cbegin();
   auto end_beta = betas.cend();
 
-  for (auto input_func : funcs) {
+  for (const auto& input_func : funcs) {
     float alpha = 0.f;
     float beta = 0.f;
     std::string func = detail::NormalizeActivationArgumentAndGetAlphaBetaCount(
@@ -188,6 +186,7 @@ ActivationFuncs::ActivationFuncs(const std::vector<std::string>& funcs,
   }
 }
 
+#if defined(DUMP_MATRIXES)
 void DumpMatrixImpl(const std::string& name, const float* src, int row, int col, int offset, int col_width) {
   std::cout << "Dump matrix: " << name << std::endl;
 
@@ -201,6 +200,112 @@ void DumpMatrixImpl(const std::string& name, const float* src, int row, int col,
     std::cout << std::endl;
   }
   std::cout << std::endl;
+}
+#endif
+
+void ComputeGemm(const int M,
+                 const int N,
+                 const int K,
+                 const float alpha,
+                 const float* A,
+                 const float* A_end,
+                 const GemmWeights<float>& weights,
+                 const float beta,
+                 float* C,
+                 float* C_end,
+                 const int ldc,
+                 uint8_t* /* quantized_A_buffer */,
+                 int32_t* /* quantize_agg_C_buffer */,
+                 concurrency::ThreadPool* thread_pool) {
+  // validate all the inputs
+  // need to use the lda/ldb/ldc strides which should be >= the columns for the span
+  ORT_ENFORCE(A + (M * K) <= A_end);
+  ORT_ENFORCE(C + (M * ldc - (ldc - N)) <= C_end);
+
+  if (weights.is_prepacked_) {
+    MlasGemm(
+        CblasNoTrans,
+        M, N, K, alpha,
+        A, K,
+        weights.buffer_, beta,
+        C, ldc, thread_pool);
+  } else {
+    ::onnxruntime::math::GemmEx<float>(
+        CblasNoTrans, CblasTrans,
+        M, N, K, alpha,
+        A, K,
+        static_cast<const float*>(weights.buffer_), K, beta,
+        C, ldc, thread_pool);
+  }
+}
+
+void ComputeGemm(const int M,
+                 const int N,
+                 const int K,
+                 const float alpha,
+                 const float* A,
+                 const float* A_end,
+                 const GemmWeights<uint8_t>& weights,
+                 const float beta,
+                 float* C,
+                 float* C_end,
+                 const int ldc,
+                 uint8_t* quantized_A_buffer,
+                 int32_t* quantize_agg_C_buffer,
+                 concurrency::ThreadPool* thread_pool) {
+  // validate all the inputs
+  // need to use the lda/ldb/ldc strides which should be >= the columns for the span
+  ORT_ENFORCE(A + (M * K) <= A_end);
+  ORT_ENFORCE(C + (M * ldc - (ldc - N)) <= C_end);
+  ORT_ENFORCE(weights.quant_para_);
+  ORT_ENFORCE(alpha == 1.0f && (beta == 0.0f || beta == 1.0f), "Quantized GEMM only support alpha equal to 1.0f and beta equal to 0.0f or 1.0f");
+
+  float a_scale;
+  uint8_t a_zero_point;
+  GetQuantizationParameter(A, M * K, a_scale, a_zero_point, thread_pool);
+
+  // quantize the data
+  ParQuantizeLinear(A, quantized_A_buffer, M * K, a_scale, a_zero_point, thread_pool);
+
+  bool b_is_signed = weights.quant_para_->is_signed;
+  uint8_t b_zero_point = weights.quant_para_->zero_point ? *static_cast<const uint8_t*>(weights.quant_para_->zero_point) : 0;
+
+  std::vector<float> scale_multiplier(weights.quant_para_->scale_size);
+  for (size_t s = 0; s < weights.quant_para_->scale_size; s++) {
+    scale_multiplier[s] = a_scale * (weights.quant_para_->scale[s]);
+  }
+
+  size_t ld_C_buffer = ldc;
+  int32_t* C_buffer = reinterpret_cast<int32_t*>(C);
+  if (beta == 1.0f) {
+    C_buffer = quantize_agg_C_buffer;
+    ld_C_buffer = static_cast<size_t>(N);
+  }
+
+  MLAS_QGEMM_SCALE_BIAS_OUTPUT_PROCESSOR output_processor(
+      C, ldc, scale_multiplier.data(), nullptr,
+      beta == 1.0f ? MLAS_QGEMM_OUTPUT_MODE::AccumulateMode : MLAS_QGEMM_OUTPUT_MODE::ZeroMode,
+      scale_multiplier.size() == 1 ? MLAS_QUANTIZATION_GRANULARITY::PerMatrix : MLAS_QUANTIZATION_GRANULARITY::PerColumn);
+
+  MLAS_GEMM_U8X8_SHAPE_PARAMS gemm_shape;
+  gemm_shape.M = static_cast<size_t>(M);
+  gemm_shape.N = static_cast<size_t>(N);
+  gemm_shape.K = static_cast<size_t>(K);
+  gemm_shape.BIsSigned = b_is_signed;
+  
+  MLAS_GEMM_U8X8_DATA_PARAMS gemm_params;
+  gemm_params.A = quantized_A_buffer;
+  gemm_params.lda = static_cast<size_t>(K);
+  gemm_params.ZeroPointA = a_zero_point;
+  gemm_params.B = weights.buffer_;
+  gemm_params.ldb = static_cast<size_t>(N);
+  gemm_params.ZeroPointB = &b_zero_point;
+  gemm_params.BIsPacked = weights.is_prepacked_;
+  gemm_params.C = C_buffer;
+  gemm_params.ldc = ld_C_buffer;
+  gemm_params.OutputProcessor = &output_processor;
+
+  MlasGemm(gemm_shape, gemm_params, thread_pool);
 }
 
 namespace deepcpu {
@@ -261,19 +366,19 @@ inline void clip_for_tanh(const float* ps, float* pd, int c) {
   }
 }
 
-void add_bias_into_ignore(const float* ps, float* pd, const int c) {
+void add_bias_into_ignore(const float* ps, const float* pd, int c) {
   ORT_UNUSED_PARAMETER(ps);
   ORT_UNUSED_PARAMETER(pd);
   ORT_UNUSED_PARAMETER(c);
 }
 
-void add_bias_into(const float* ps, float* pd, const int c) {
+void add_bias_into(const float* ps, float* pd, int c) {
   for (int i = 0; i < c; i++) {
     pd[i] += ps[i];
   }
 }
 
-void clip(const float b, float* pd, const int c) {
+void clip(const float b, float* pd, int c) {
   for (int i = 0; i < c; i++) {
     float x = pd[i];
     if (x > b)
@@ -283,7 +388,7 @@ void clip(const float b, float* pd, const int c) {
   }
 }
 
-void clip_ignore_bias(const float b, const float* pb, float* pd, const int c) {
+void clip_ignore_bias(const float b, const float* pb, float* pd, int c) {
   ORT_UNUSED_PARAMETER(pb);
 
   for (int i = 0; i < c; i++) {
@@ -297,7 +402,7 @@ void clip_ignore_bias(const float b, const float* pb, float* pd, const int c) {
   }
 }
 
-void clip_add_bias(const float b, const float* pb, float* pd, const int c) {
+void clip_add_bias(const float b, const float* pb, float* pd, int c) {
   for (int i = 0; i < c; i++) {
     float x = pd[i] + pb[i];
     if (x > b)
@@ -357,8 +462,7 @@ void tanh_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
   }
 }
 
-void relu_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
-            const float alpha, const float beta) {
+void relu_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(ps1_c);
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
@@ -369,17 +473,16 @@ void relu_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
   }
 }
 
-void composed_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
-                std::function<float(float, float, float)> func,
-                const float alpha, const float beta) {
+void composed_m(const float* ps1, const float* ps1_c, const float* ps2, float* pd, int c,
+                std::function<float(float, float, float)> func, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(ps1_c);
   for (int i = 0; i < c; i++) {
     pd[i] = ps2[i] * func(ps1[i], alpha, beta);
   }
 }
 
-void sigmoid_exact_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
-                     const float alpha, const float beta) {
+void sigmoid_exact_m(const float* ps1, const float* ps1_c, const float* ps2, float* pd, int c, float alpha,
+                     float beta) {
   ORT_UNUSED_PARAMETER(ps1_c);
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
@@ -390,8 +493,7 @@ void sigmoid_exact_m(const float* ps1, float* ps1_c, const float* ps2, float* pd
   }
 }
 
-void tanh_exact_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, int c,
-                  const float alpha, const float beta) {
+void tanh_exact_m(const float* ps1, const float* ps1_c, const float* ps2, float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(ps1_c);
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
@@ -401,7 +503,7 @@ void tanh_exact_m(const float* ps1, float* ps1_c, const float* ps2, float* pd, i
   }
 }
 
-void sigmoid(float* pd, int c, const float alpha, const float beta) {
+void sigmoid(float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -424,7 +526,7 @@ void sigmoid(float* pd, int c, const float alpha, const float beta) {
   }
 }
 
-void tanh(float* pd, int c, const float alpha, const float beta) {
+void tanh(float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -447,7 +549,7 @@ void tanh(float* pd, int c, const float alpha, const float beta) {
   }
 }
 
-void relu(float* pd, int c, const float alpha, const float beta) {
+void relu(float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -457,7 +559,7 @@ void relu(float* pd, int c, const float alpha, const float beta) {
   }
 }
 
-void sigmoid_exact(float* pd, int c, const float alpha, const float beta) {
+void sigmoid_exact(float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -467,7 +569,7 @@ void sigmoid_exact(float* pd, int c, const float alpha, const float beta) {
   }
 }
 
-void tanh_exact(float* pd, int c, const float alpha, const float beta) {
+void tanh_exact(float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -477,15 +579,14 @@ void tanh_exact(float* pd, int c, const float alpha, const float beta) {
   }
 }
 
-void merge_lstm_gates_to_memory(const float* pprev, const float* pi, const float* pf, const float* pg,
-                                float* pcurr, const int c) {
+void merge_lstm_gates_to_memory(const float* pprev, const float* pi, const float* pf, const float* pg, float* pcurr,
+                                int c) {
   for (int i = 0; i < c; i++) {
     pcurr[i] = pprev[i] * pf[i] + pi[i] * pg[i];
   }
 }
 
-void gru_reset_gate_tanh(const float* ps1, float* ps2, float* pd, const int c,
-                         const float alpha, const float beta) {
+void gru_reset_gate_tanh(const float* ps1, float* ps2, float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -508,8 +609,7 @@ void gru_reset_gate_tanh(const float* ps1, float* ps2, float* pd, const int c,
   }
 }
 
-void gru_reset_gate_sigmoid(const float* ps1, float* ps2, float* pd, const int c,
-                            const float alpha, const float beta) {
+void gru_reset_gate_sigmoid(const float* ps1, float* ps2, float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -532,8 +632,7 @@ void gru_reset_gate_sigmoid(const float* ps1, float* ps2, float* pd, const int c
   }
 }
 
-void gru_reset_gate_relu(const float* ps1, float* ps2, float* pd, const int c,
-                         const float alpha, const float beta) {
+void gru_reset_gate_relu(const float* ps1, float* ps2, float* pd, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -543,16 +642,14 @@ void gru_reset_gate_relu(const float* ps1, float* ps2, float* pd, const int c,
   }
 }
 
-void gru_reset_gate_composed(const float* ps1, float* ps2, float* pd, const int c,
-                             std::function<float(float, float, float)> func,
-                             const float alpha, const float beta) {
+void gru_reset_gate_composed(const float* ps1, float* ps2, float* pd, int c,
+                             std::function<float(float, float, float)> func, float alpha, float beta) {
   for (int i = 0; i < c; i++) {
     pd[i] = ps1[i] * func(ps2[i], alpha, beta);
   }
 }
 
-void gru_output_gate_tanh(float* ph, const float* pz, const float* ps, float* po, const int c,
-                          const float alpha, const float beta) {
+void gru_output_gate_tanh(float* ph, const float* pz, const float* ps, float* po, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -575,8 +672,7 @@ void gru_output_gate_tanh(float* ph, const float* pz, const float* ps, float* po
   }
 }
 
-void gru_output_gate_relu(float* ph, const float* pz, const float* ps, float* po, const int c,
-                          const float alpha, const float beta) {
+void gru_output_gate_relu(float* ph, const float* pz, const float* ps, float* po, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -586,16 +682,14 @@ void gru_output_gate_relu(float* ph, const float* pz, const float* ps, float* po
   }
 }
 
-void gru_output_gate_composed(float* ph, const float* pz, const float* ps, float* po, const int c,
-                              std::function<float(float, float, float)> func,
-                              const float alpha, const float beta) {
+void gru_output_gate_composed(float* ph, const float* pz, const float* ps, float* po, int c,
+                              std::function<float(float, float, float)> func, float alpha, float beta) {
   for (int i = 0; i < c; i++) {
     po[i] = (1 - pz[i]) * func(ph[i], alpha, beta) + pz[i] * ps[i];
   }
 }
 
-void gru_output_gate_sigmoid(float* ph, const float* pz, const float* ps, float* po, const int c,
-                             const float alpha, const float beta) {
+void gru_output_gate_sigmoid(float* ph, const float* pz, const float* ps, float* po, int c, float alpha, float beta) {
   ORT_UNUSED_PARAMETER(alpha);
   ORT_UNUSED_PARAMETER(beta);
 
@@ -618,33 +712,29 @@ void gru_output_gate_sigmoid(float* ph, const float* pz, const float* ps, float*
   }
 }
 
-void composed_activation_func(float* ps, const int c,
-                              std::function<float(float, float, float)> func,
-                              const float alpha, const float beta) {
+void composed_activation_func(float* ps, int c, std::function<float(float, float, float)> func, float alpha,
+                              float beta) {
   for (int i = 0; i < c; i++) {
     ps[i] = func(ps[i], alpha, beta);
   }
 }
 
-void composed_lstm_merge_gates_func(float* ps, const int c,
-                                    std::function<float(float, float, float)> func,
-                                    const float alpha, const float beta) {
+void composed_lstm_merge_gates_func(float* ps, int c, std::function<float(float, float, float)> func, float alpha,
+                                    float beta) {
   for (int i = 0; i < c; i++) {
     ps[i] = func(ps[i], alpha, beta);
   }
 }
 
-void composed_gru_reset_gate_func(float* ps, const int c,
-                                  std::function<float(float, float, float)> func,
-                                  const float alpha, const float beta) {
+void composed_gru_reset_gate_func(float* ps, int c, std::function<float(float, float, float)> func, float alpha,
+                                  float beta) {
   for (int i = 0; i < c; i++) {
     ps[i] = func(ps[i], alpha, beta);
   }
 }
 
-void composed_gru_output_gate_func(float* ps, const int c,
-                                   std::function<float(float, float, float)> func,
-                                   const float alpha, const float beta) {
+void composed_gru_output_gate_func(float* ps, int c, std::function<float(float, float, float)> func, float alpha,
+                                   float beta) {
   for (int i = 0; i < c; i++) {
     ps[i] = func(ps[i], alpha, beta);
   }
@@ -661,42 +751,39 @@ ActivationFuncPtr ActivationFuncByName(const std::string& func) {
     return relu;
 
   if (func == "affine")
-    return [](float* ps, const int c, const float alpha, const float beta) {
-      composed_activation_func(ps, c, Affine<float>, alpha, beta);
-    };
+    return
+        [](float* ps, int c, float alpha, float beta) { composed_activation_func(ps, c, Affine<float>, alpha, beta); };
 
   if (func == "leakyrelu")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, LeakyRelu<float>, alpha, beta);
     };
 
   if (func == "thresholdedrelu")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, ThresholdedRelu<float>, alpha, beta);
     };
 
   if (func == "scaledtanh")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, ScaledTanh<float>, alpha, beta);
     };
 
   if (func == "hardsigmoid")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, HardSigmoid<float>, alpha, beta);
     };
 
   if (func == "elu")
-    return [](float* ps, const int c, const float alpha, const float beta) {
-      composed_activation_func(ps, c, Elu<float>, alpha, beta);
-    };
+    return [](float* ps, int c, float alpha, float beta) { composed_activation_func(ps, c, Elu<float>, alpha, beta); };
 
   if (func == "softsign")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, Softsign<float>, alpha, beta);
     };
 
   if (func == "softplus")
-    return [](float* ps, const int c, const float alpha, const float beta) {
+    return [](float* ps, int c, float alpha, float beta) {
       composed_activation_func(ps, c, Softplus<float>, alpha, beta);
     };
 
@@ -714,50 +801,42 @@ LstmMergeGatesFuncPtr LstmMergeGatesFuncByName(const std::string& func) {
     return relu_m;
 
   if (func == "affine")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, Affine<float>, alpha, beta);
     };
 
   if (func == "leakyrelu")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, LeakyRelu<float>, alpha, beta);
     };
 
   if (func == "thresholdedrelu")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, ThresholdedRelu<float>, alpha, beta);
     };
 
   if (func == "scaledtanh")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, ScaledTanh<float>, alpha, beta);
     };
 
   if (func == "hardsigmoid")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, HardSigmoid<float>, alpha, beta);
     };
 
   if (func == "elu")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, Elu<float>, alpha, beta);
     };
 
   if (func == "softsign")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, Softsign<float>, alpha, beta);
     };
 
   if (func == "softplus")
-    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](const float* ps1, float* ps1_c, const float* ps2, float* ps3, int c, float alpha, float beta) {
       composed_m(ps1, ps1_c, ps2, ps3, c, Softplus<float>, alpha, beta);
     };
 
@@ -775,42 +854,42 @@ GruResetGateFuncPtr GruResetGateFuncByName(const std::string& func) {
     return gru_reset_gate_relu;
 
   if (func == "affine")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, Affine<float>, alpha, beta);
     };
 
   if (func == "leakyrelu")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, LeakyRelu<float>, alpha, beta);
     };
 
   if (func == "thresholdedrelu")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, ThresholdedRelu<float>, alpha, beta);
     };
 
   if (func == "scaledtanh")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, ScaledTanh<float>, alpha, beta);
     };
 
   if (func == "hardsigmoid")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, HardSigmoid<float>, alpha, beta);
     };
 
   if (func == "elu")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, Elu<float>, alpha, beta);
     };
 
   if (func == "softsign")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, Softsign<float>, alpha, beta);
     };
 
   if (func == "softplus")
-    return [](const float* ps1, float* ps2, float* ps3, const int c, const float alpha, const float beta) {
+    return [](const float* ps1, float* ps2, float* ps3, int c, float alpha, float beta) {
       gru_reset_gate_composed(ps1, ps2, ps3, c, Softplus<float>, alpha, beta);
     };
 
@@ -828,50 +907,42 @@ GruOutputGateFuncPtr GruOutputGateFuncByName(const std::string& func) {
     return gru_output_gate_relu;
 
   if (func == "affine")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, Affine<float>, alpha, beta);
     };
 
   if (func == "leakyrelu")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, LeakyRelu<float>, alpha, beta);
     };
 
   if (func == "thresholdedrelu")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, ThresholdedRelu<float>, alpha, beta);
     };
 
   if (func == "scaledtanh")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, ScaledTanh<float>, alpha, beta);
     };
 
   if (func == "hardsigmoid")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, HardSigmoid<float>, alpha, beta);
     };
 
   if (func == "elu")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, Elu<float>, alpha, beta);
     };
 
   if (func == "softsign")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, Softsign<float>, alpha, beta);
     };
 
   if (func == "softplus")
-    return [](float* ps1, const float* ps2, const float* ph, float* ps3, const int c,
-              const float alpha, const float beta) {
+    return [](float* ps1, const float* ps2, const float* ph, float* ps3, int c, float alpha, float beta) {
       gru_output_gate_composed(ps1, ps2, ph, ps3, c, Softplus<float>, alpha, beta);
     };
 

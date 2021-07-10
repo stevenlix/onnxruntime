@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
+#include "core/graph/onnx_protobuf.h"
 
 #include "core/session/inference_session.h"
 
@@ -184,11 +185,11 @@ OpKernel* CreateOptionalOpKernel(const OpKernelInfo& kernel_info) {
   return new OptionalOpKernel<float>(kernel_info);
 }
 
-static const std::string MUL_MODEL_URI = "testdata/mul_1.pb";
-static const std::string FOO_MODEL_URI = "testdata/foo_1.pb";
-static const std::string FOO_TRUNCATE_MODEL_URI = "testdata/foo_2.pb";
+static const std::string MUL_MODEL_URI = "testdata/mul_1.onnx";
+static const std::string FOO_MODEL_URI = "testdata/foo_1.onnx";
+static const std::string FOO_TRUNCATE_MODEL_URI = "testdata/foo_2.onnx";
 
-static const std::string OPTIONAL_MODEL1_URI = "testdata/optional_1.pb";
+static const std::string OPTIONAL_MODEL1_URI = "testdata/optional_1.onnx";
 
 void RunSession(InferenceSession& session_object,
                 RunOptions& run_options,
@@ -197,7 +198,7 @@ void RunSession(InferenceSession& session_object,
                 std::vector<int64_t>& dims_y,
                 std::vector<float>& values_y) {
   // prepare inputs
-  MLValue ml_value;
+  OrtValue ml_value;
   CreateMLValue<float>(TestCPUExecutionProvider()->GetAllocator(0, OrtMemTypeDefault), dims_x, values_x, &ml_value);
   NameMLValMap feeds;
   feeds.insert(std::make_pair("X", ml_value));
@@ -205,16 +206,17 @@ void RunSession(InferenceSession& session_object,
   // prepare outputs
   std::vector<std::string> output_names;
   output_names.push_back("Y");
-  std::vector<MLValue> fetches;
+  std::vector<OrtValue> fetches;
 
   // Now run
   common::Status st = session_object.Run(run_options, feeds, output_names, &fetches);
   std::cout << "Run returned status: " << st.ErrorMessage() << std::endl;
   EXPECT_TRUE(st.IsOK());
-  ASSERT_EQ(1, fetches.size());
+  ASSERT_EQ(1u, fetches.size());
   auto& rtensor = fetches.front().Get<Tensor>();
   TensorShape expected_shape(dims_y);
-  EXPECT_EQ(expected_shape, rtensor.Shape());
+  //Use reinterpret_cast to bypass a gcc bug: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=51213
+  EXPECT_EQ(*reinterpret_cast<const std::vector<int64_t>*>(&expected_shape), *reinterpret_cast<const std::vector<int64_t>*>(&rtensor.Shape()));
   const std::vector<float> found(rtensor.template Data<float>(), rtensor.template Data<float>() + expected_shape.Size());
   ASSERT_EQ(values_y, found);
 }
@@ -227,7 +229,7 @@ TEST(CustomKernelTests, CustomKernelWithBuildInSchema) {
   // Register a foo kernel which is doing Add, but bind to Mul.
   std::shared_ptr<CustomRegistry> registry = std::make_shared<CustomRegistry>();
 
-  InferenceSession session_object{so, &DefaultLoggingManager()};
+  InferenceSession session_object{so, GetEnvironment()};
   EXPECT_TRUE(session_object.RegisterCustomRegistry(registry).IsOK());
   auto def = FooKernelDef("Mul");
 
@@ -259,7 +261,7 @@ TEST(CustomKernelTests, CustomKernelWithCustomSchema) {
 
   std::shared_ptr<CustomRegistry> registry = std::make_shared<CustomRegistry>();
 
-  InferenceSession session_object{so, &DefaultLoggingManager()};
+  InferenceSession session_object{so, GetEnvironment()};
   EXPECT_TRUE(session_object.RegisterCustomRegistry(registry).IsOK());
 
   //register foo schema
@@ -305,7 +307,7 @@ TEST(CustomKernelTests, CustomKernelWithOptionalOutput) {
   //Register a foo kernel which is doing Add, but bind to Mul.
   EXPECT_TRUE(registry->RegisterCustomKernel(def, CreateOptionalOpKernel).IsOK());
 
-  InferenceSession session_object{so, &DefaultLoggingManager()};
+  InferenceSession session_object{so, GetEnvironment()};
   EXPECT_TRUE(session_object.RegisterCustomRegistry(registry).IsOK());
   EXPECT_TRUE(session_object.Load(OPTIONAL_MODEL1_URI).IsOK());
   EXPECT_TRUE(session_object.Initialize().IsOK());

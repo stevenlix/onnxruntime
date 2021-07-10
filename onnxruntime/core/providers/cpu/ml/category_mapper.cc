@@ -3,7 +3,7 @@
 
 #include "core/providers/cpu/ml/category_mapper.h"
 #include <algorithm>
-#include <gsl/span>
+#include <gsl/gsl>
 using namespace ::onnxruntime::common;
 
 namespace onnxruntime {
@@ -21,16 +21,14 @@ ONNX_CPU_OPERATOR_ML_KERNEL(
     CategoryMapper);
 
 Status CategoryMapper::Compute(OpKernelContext* context) const {
-  const Tensor* tensor_pointer = context->Input<Tensor>(0);
+  const auto* tensor_pointer = context->Input<Tensor>(0);
   if (tensor_pointer == nullptr) return Status(common::ONNXRUNTIME, common::FAIL, "input count mismatch");
   const Tensor& X = *tensor_pointer;
   const TensorShape& shape = X.Shape();
-  Tensor& Y = *context->Output(0, TensorShape(shape));
+  Tensor& Y = *context->Output(0, shape);
 
-  auto input_type = X.DataType();
-
-  if (input_type == DataTypeImpl::GetType<std::string>()) {
-    if (Y.DataType() != DataTypeImpl::GetType<int64_t>())
+  if (X.IsDataTypeString()) {
+    if (!Y.IsDataType<int64_t>())
       return Status(ONNXRUNTIME, FAIL, "Input of string must have output of int64");
 
     auto input = gsl::make_span(X.template Data<std::string>(), shape.Size());
@@ -47,7 +45,7 @@ Status CategoryMapper::Compute(OpKernelContext* context) const {
                     ++out;
                   });
   } else {
-    if (Y.DataType() != DataTypeImpl::GetType<std::string>())
+    if (!Y.IsDataTypeString())
       return Status(ONNXRUNTIME, FAIL, "Input of int64 must have output of string ");
 
     auto input = gsl::make_span(X.template Data<int64_t>(), shape.Size());

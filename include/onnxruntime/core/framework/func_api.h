@@ -1,23 +1,8 @@
 #pragma once
-#include "core/common/common.h"
-namespace onnxruntime {
-//TODO: Should use the lotus cpi element type definition.
-enum DType {
-  TFloat32 = 0,
-  TInt32 = 1,
-  TDouble = 2
-  //TODO: more types
-};
+#include "core/common/status.h"
+using onnxruntime::common::Status;  // TODO: Needed by WinML, but shouldn't be put into the global namespace like this
 
-typedef struct {
-  void* data;
-  /*! \brief Number of dimensions */
-  size_t ndim;
-  /*! \brief The data type of the pointer*/
-  DType dtype;
-  /*! \brief The shape of the tensor */
-  int64_t* shape;
-} ONNXRunTimeTensor;
+namespace onnxruntime {
 
 // AllocateFunc(void* handle, size_t alignment, size_t size)
 using AllocateFunc = void* (*)(void*, size_t, size_t);
@@ -35,8 +20,8 @@ typedef struct {
 using FunctionState = void*;
 // take the ComputeContext, and create a function state.
 using CreateFunctionStateC = int (*)(ComputeContext*, FunctionState*);
-// pass in the function state and input/output tensors, perform compute and return status code, 0 - succeed.
-using ComputeFuncC = int (*)(FunctionState, ONNXRunTimeTensor*, size_t, ONNXRunTimeTensor*, size_t);
+// pass in the function state and input/output tensors, perform compute and return status
+using ComputeFuncC = common::Status (*)(FunctionState, const OrtApi*, OrtKernelContext*);
 // release the function state.
 using DestroyFunctionStateC = void (*)(FunctionState);
 }  // namespace onnxruntime

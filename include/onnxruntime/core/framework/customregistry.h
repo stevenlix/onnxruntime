@@ -5,20 +5,29 @@
 
 #include "core/common/status.h"
 #include "core/common/logging/logging.h"
-#include "core/graph/schema_registry.h"
 #include "core/framework/op_kernel.h"
 #include "core/framework/kernel_def_builder.h"
 #include "core/framework/kernel_registry.h"
+
+#if !defined(ORT_MINIMAL_BUILD)
+#include "core/graph/schema_registry.h"
+#endif
 
 namespace onnxruntime {
 
 /**
    Represents a registry that contains both custom kernels and custom schemas.
 */
-class CustomRegistry : public KernelRegistry, public onnxruntime::OnnxRuntimeOpSchemaRegistry {
+class CustomRegistry final {
  public:
-  CustomRegistry() = default;
-  ~CustomRegistry() override = default;
+  CustomRegistry()
+      : kernel_registry_(std::make_shared<KernelRegistry>())
+#if !defined(ORT_MINIMAL_BUILD)
+        ,
+        opschema_registry_(std::make_shared<onnxruntime::OnnxRuntimeOpSchemaRegistry>())
+#endif
+  {
+  }
 
   /**
    * Register a kernel definition together with kernel factory method to this session.
@@ -31,8 +40,21 @@ class CustomRegistry : public KernelRegistry, public onnxruntime::OnnxRuntimeOpS
 
   common::Status RegisterCustomKernel(KernelCreateInfo&);
 
+  const std::shared_ptr<KernelRegistry>& GetKernelRegistry();
+
+#if !defined(ORT_MINIMAL_BUILD)
+  common::Status RegisterOpSet(std::vector<ONNX_NAMESPACE::OpSchema>& schemas, const std::string& domain,
+                               int baseline_opset_version, int opset_version);
+
+  const std::shared_ptr<onnxruntime::OnnxRuntimeOpSchemaRegistry>& GetOpschemaRegistry();
+#endif
+
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(CustomRegistry);
+  std::shared_ptr<KernelRegistry> kernel_registry_;
+#if !defined(ORT_MINIMAL_BUILD)
+  std::shared_ptr<onnxruntime::OnnxRuntimeOpSchemaRegistry> opschema_registry_;
+#endif
 };
 
 }  // namespace onnxruntime
